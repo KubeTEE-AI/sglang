@@ -14,7 +14,7 @@ Covers:
 
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, MagicMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import msgspec
 
@@ -137,6 +137,8 @@ def _make_tokenizer_manager(case) -> TokenizerManager:
     tm.dump_requests_folder = ""
     tm.crash_dump_folder = ""
     tm.send_to_scheduler = MagicMock()
+    tm.tokenizer_ipc_name = None
+    tm.server_args.tokenizer_worker_num = 1
     return tm
 
 
@@ -448,6 +450,7 @@ def _make_generate_obj(rid, is_single):
     obj.external_trace_header = None
     obj.bootstrap_room = None
     obj.max_thinking_tokens = None
+    obj.return_prompt_token_ids = False
     obj.normalize_batch_and_arguments = Mock()
     if not is_single:
         obj.__getitem__.side_effect = lambda i: Mock()
@@ -611,6 +614,140 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
             asyncio.run(drive())
 
         self.assertFalse(tm.rid_to_state)
+
+
+class TestAbortPendingKeepUntilEcho(CustomTestCase):
+    """Disconnect aborts immediately but keeps rid_to_state until the echo.
+
+    Abort-then-pop (#35936) stopped the GPU zombie, then leftover in-flight
+    decode tokens hit "state was deleted". Keep the public abort_request
+    guard (no force=); delayed create_abort_task is a no-op via abort_sent.
+    """
+
+    def test_cancelled_dispatches_abort_and_keeps_state(self):
+        tm = _make_tm_for_generate(self)
+        rid = "cancel_keep"
+        obj = _make_generate_obj(rid, is_single=True)
+        tokenized = Mock()
+        tokenized.input_ids = [1, 2, 3]
+        tm._tokenize_one_request = AsyncMock(return_value=tokenized)
+        tm._send_one_request = Mock()
+        tm._dispatch_to_scheduler = Mock()
+
+        async def _wait(*args, **kwargs):
+            raise asyncio.CancelledError()
+            yield  # pragma: no cover
+
+        tm._wait_one_response = _wait
+
+        async def drive():
+            await tm.generate_request(obj).__anext__()
+
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(drive())
+
+        self.assertIn(rid, tm.rid_to_state)
+        self.assertTrue(tm.rid_to_state[rid].abort_sent)
+        tm._send_one_request.assert_called_once()
+        tm._dispatch_to_scheduler.assert_called_once()
+        sent = tm._dispatch_to_scheduler.call_args[0][0]
+        self.assertIsInstance(sent, AbortReq)
+        self.assertEqual(sent.rid, rid)
+
+    def test_delayed_abort_is_noop_after_disconnect(self):
+        tm = _make_tm_for_generate(self)
+        rid = "delayed_noop"
+        obj = _make_generate_obj(rid, is_single=True)
+        tokenized = Mock()
+        tokenized.input_ids = [1]
+        tm._tokenize_one_request = AsyncMock(return_value=tokenized)
+        tm._send_one_request = Mock()
+        tm._dispatch_to_scheduler = Mock()
+
+        async def _wait(*args, **kwargs):
+            raise asyncio.CancelledError()
+            yield  # pragma: no cover
+
+        tm._wait_one_response = _wait
+
+        async def drive():
+            await tm.generate_request(obj).__anext__()
+
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(drive())
+
+        tm.abort_request(rid)
+        self.assertEqual(tm._dispatch_to_scheduler.call_count, 1)
+
+    def test_unknown_rid_still_guarded(self):
+        tm = _make_tokenizer_manager(self)
+        tm._dispatch_to_scheduler = Mock()
+        tm.abort_request("never_seen")
+        tm._dispatch_to_scheduler.assert_not_called()
+
+    def test_leftover_decode_chunk_applies_to_kept_state(self):
+        tm = _make_tokenizer_manager(self)
+        tm._dispatch_to_scheduler = Mock()
+        rid = "leftover_keep"
+        state = _make_req_state(rid)
+        tm.rid_to_state[rid] = state
+        tm.abort_request(rid)
+        self.assertTrue(state.abort_sent)
+
+        batch = _make_batch_str_output(rid, finished_reason=_NOT_FINISHED)
+        asyncio.run(tm._handle_batch_output(batch))
+
+        self.assertIn(rid, tm.rid_to_state)
+        self.assertEqual(state.get_text(), "hello")
+
+    def test_abort_echo_pops_kept_state(self):
+        tm = _make_tokenizer_manager(self)
+        tm._dispatch_to_scheduler = Mock()
+        rid = "echo_pop"
+        state = _make_req_state(rid)
+        tm.rid_to_state[rid] = state
+        tm.abort_request(rid)
+        tm._handle_abort_req(_make_abort_req(rid))
+        self.assertNotIn(rid, tm.rid_to_state)
+
+    def test_abort_finished_batch_after_pop_is_silent(self):
+        tm = _make_tokenizer_manager(self)
+        rid = "already_gone"
+        batch = _make_batch_str_output(
+            rid, finished_reason={"type": "abort", "message": "Aborted"}
+        )
+        with patch(
+            "sglang.srt.managers.tokenizer_manager.logger.error"
+        ) as log_error:
+            asyncio.run(tm._handle_batch_output(batch))
+            log_error.assert_not_called()
+
+    def test_valueerror_after_abort_sent_keeps_state(self):
+        tm = _make_tm_for_generate(self)
+        rid = "type3_keep"
+        obj = _make_generate_obj(rid, is_single=True)
+        tokenized = Mock()
+        tokenized.input_ids = [1]
+        tm._tokenize_one_request = AsyncMock(return_value=tokenized)
+        tm._send_one_request = Mock()
+        tm._dispatch_to_scheduler = Mock()
+
+        async def _wait(wait_obj, request):
+            tm.abort_request(wait_obj.rid)
+            raise ValueError("Client disconnected")
+            yield  # pragma: no cover
+
+        tm._wait_one_response = _wait
+
+        async def drive():
+            await tm.generate_request(obj).__anext__()
+
+        with self.assertRaises(ValueError):
+            asyncio.run(drive())
+
+        self.assertIn(rid, tm.rid_to_state)
+        self.assertTrue(tm.rid_to_state[rid].abort_sent)
+        self.assertEqual(tm._dispatch_to_scheduler.call_count, 1)
 
 
 if __name__ == "__main__":

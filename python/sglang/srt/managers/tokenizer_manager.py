@@ -294,6 +294,12 @@ class ReqState:
     # For return_prompt_token_ids: stores prompt token IDs captured after tokenization
     prompt_token_ids: Optional[List[int]] = None
 
+    # Set when AbortReq has been sent for this rid. Disconnect cleanup keeps
+    # rid_to_state until the scheduler abort echo / finished batch so leftover
+    # decode chunks are normal output, not "state was deleted". The delayed
+    # create_abort_task is then a no-op.
+    abort_sent: bool = False
+
 
 def _slice_streaming_output_meta_info(
     meta_info: Dict[Any, Any],
@@ -819,15 +825,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 else:
                     async for response in self._handle_batch_request(obj, request):
                         yield response
+        except (asyncio.CancelledError, GeneratorExit):
+            # Client disconnect mid-decode: tell the scheduler to stop now, but
+            # keep rid_to_state until the abort echo / finished batch. Aborting
+            # then immediately popping (#35936 abort-then-pop) leaves leftover
+            # decode tokens to hit "state was deleted". Pre-dispatch failures
+            # are not CancelledError — they take the BaseException path below.
+            self._abort_pending_req_states(obj)
+            raise
         except BaseException:
-            # Entries still present here never completed — including client
-            # disconnect (CancelledError/GeneratorExit) while the scheduler is
-            # still decoding. Abort on the scheduler BEFORE dropping HTTP state
-            # or the delayed create_abort_task is dropped by abort_request()'s
-            # rid_to_state guard and the GPU runs to max_new_tokens.
-            # Vendored from sgl-project/sglang#35936 (abort-then-pop). Keep the
-            # public abort_request guard — scheduler match is prefix-based.
-            self._abort_and_discard_pending_req_states(obj)
+            # Failure before the scheduler (validation, tokenize). Pop only —
+            # never abort an unknown rid (scheduler match is prefix-based).
+            # If abort_request already ran (non-stream disconnect type 1/3),
+            # keep state for the same leftover-token reason as CancelledError.
+            if not self._any_abort_sent(obj):
+                self._discard_pending_req_states(obj)
             raise
 
     def _detect_input_format(
@@ -1999,6 +2011,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and rid not in self.rid_to_state
         ):
             return
+        if not abort_all:
+            state = self.rid_to_state.get(rid)
+            if state is not None:
+                if state.abort_sent:
+                    return
+                state.abort_sent = True
         req = AbortReq(rid=rid, abort_all=abort_all)
         self._dispatch_to_scheduler(req)
         if self.enable_metrics:
@@ -2231,6 +2249,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if state is None:
                 # Known race: /health_generate pops its rid as soon as ANY message bumps last_receive_tstamp.
                 if rid.startswith(HEALTH_CHECK_RID_PREFIX):
+                    continue
+                # Abort echo can win the race against the leftover in-flight
+                # decode batch and delete rid_to_state first. That output is
+                # the abort itself, not a zombie.
+                finished_reason = recv_obj.finished_reasons[i]
+                if (
+                    isinstance(finished_reason, dict)
+                    and finished_reason.get("type") == "abort"
+                ):
                     continue
                 logger.error(
                     f"Received output for {rid=} but the state was deleted in TokenizerManager."
@@ -3414,39 +3441,42 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
 
-    def _abort_and_discard_pending_req_states(self, obj):
-        """Abort still-pending requests on the scheduler, then drop their state.
-
-        Dispatch happens BEFORE the pop: once rid_to_state is gone, no code path
-        is left that can tell the scheduler to stop the request -- the delayed
-        create_abort_task would be dropped by the rid_to_state guard in
-        abort_request(). Only concrete, still-tracked rids are dispatched
-        (never arbitrary caller input), and a later output for a discarded rid
-        is ignored (the scheduler-response path looks up state with
-        ``.get(...)``), so this is safe for partial/failed dispatches.
-
-        A dispatch failure must not abort the cleanup loop: the state is still
-        removed (``finally``) and the remaining rids are processed, so a broken
-        scheduler socket cannot leak entries or mask the original
-        CancelledError/GeneratorExit that triggered the cleanup.
-
-        Vendored from sgl-project/sglang#35936. abort_request() is unchanged.
-        """
+    def _iter_obj_rids(self, obj):
         if not hasattr(obj, "is_single") or obj.is_single:
-            rids = [obj.rid]
-        else:
-            rids = obj.rid
-        for rid in rids:
-            if rid in self.rid_to_state:
-                try:
-                    self._dispatch_to_scheduler(AbortReq(rid=rid))
-                except Exception:
-                    logger.exception(
-                        "Failed to abort request during disconnect cleanup: %s",
-                        rid,
-                    )
-                finally:
-                    self.rid_to_state.pop(rid, None)
+            return [obj.rid]
+        return obj.rid
+
+    def _any_abort_sent(self, obj) -> bool:
+        return any(
+            (state := self.rid_to_state.get(rid)) is not None and state.abort_sent
+            for rid in self._iter_obj_rids(obj)
+        )
+
+    def _discard_pending_req_states(self, obj):
+        """Drop rid_to_state for requests that never reached the scheduler."""
+        for rid in self._iter_obj_rids(obj):
+            self.rid_to_state.pop(rid, None)
+
+    def _abort_pending_req_states(self, obj):
+        """Dispatch AbortReq for still-tracked rids; keep state until echo.
+
+        Immediate abort (do not wait for create_abort_task's 2s sleep). Do not
+        pop: leftover decode tokens are applied to the live ReqState, then
+        _handle_abort_req / finished _handle_batch_output remove it. abort_sent
+        makes the delayed abort and a second cleanup a no-op. The public
+        abort_request guard is unchanged (unknown rids are not dispatched;
+        scheduler match is prefix-based).
+        """
+        for rid in self._iter_obj_rids(obj):
+            if rid not in self.rid_to_state:
+                continue
+            try:
+                self.abort_request(rid)
+            except Exception:
+                logger.exception(
+                    "Failed to abort request during disconnect cleanup: %s",
+                    rid,
+                )
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
