@@ -70,6 +70,13 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_WAN_2_2_TI2V_5B_MODEL_NAME_FOR_TEST,
 )
 
+# Hardware acceptance policy (KubeTEE, 2026-10-16): only NVIDIA Blackwell and
+# NVIDIA Vera Rubin nodes are accepted as new cluster capacity; Hopper
+# (H100/H200) is DEPRECATED, so that cluster capacity is maximized for subnet
+# miner emissions. Existing Hopper nodes will be removed as new Blackwell nodes
+# are onboarded (target: November 2026). Node onboarding policy of record:
+# kubetee-subnet/docs/GPU-NODE-REQUIREMENTS.md.
+
 _CACHE_DIT_CONFIG_DIR = Path(__file__).parent / "configs"
 
 
@@ -631,7 +638,8 @@ if not current_platform.is_hip():
 # Skip all ModelOpt tests on AMD: FP8 requires torch._scaled_mm (HIPBLAS_STATUS_NOT_SUPPORTED
 # on ROCm), NVFP4 requires flashinfer or sgl_kernel FP4 kernels (CUDA-only).
 # Run FP8 cases on the regular H100 1-GPU CI shard and keep only B200-only
-# quantization coverage in the B200 suite.
+# quantization coverage in the B200 suite. (H100 is deprecated per the KubeTEE
+# 2026-10-16 policy; the shard naming is kept until the CI lanes are renamed.)
 if current_platform.is_hip():
     ONE_GPU_MODELOPT_FP8_CASES = []
     ONE_GPU_MODELOPT_NVFP4_CASES = []
@@ -730,7 +738,10 @@ else:
 
 ONE_GPU_B200_CASES = ONE_GPU_MODELOPT_NVFP4_CASES
 
-MINIMAX_H3_FOUR_GPU_H100_CASES = [
+# Hardware acceptance policy (KubeTEE, 2026-10-16): Hopper (H100/H200) is
+# DEPRECATED — this 4-GPU H100 suite is retained for reference only and is
+# excluded from CI (see FILE_SUITES["4-gpu-h100"] below, also disabled).
+_DISABLED_MINIMAX_H3_FOUR_GPU_H100_CASES = [
     DiffusionTestCase(
         "minimax_h3_fl2va_first_frame_4gpu_h100",
         DiffusionServerArgs(
@@ -877,6 +888,10 @@ MINIMAX_H3_FOUR_GPU_H100_CASES = [
         run_t2v_input_reference_check=False,
     ),
 ]
+# Hardware acceptance policy (KubeTEE, 2026-10-16): Hopper (H100/H200) is
+# DEPRECATED — the H100 cases above are retained for reference only and are not
+# run. Keep the public binding (empty) so test_server_4_gpu_h100.py imports.
+MINIMAX_H3_FOUR_GPU_H100_CASES: list[DiffusionTestCase] = []
 
 TWO_GPU_CASES = [
     DiffusionTestCase(
@@ -1352,7 +1367,15 @@ if not current_platform.is_hip():
     )
 
 ONE_GPU_CASES += ONE_GPU_MODELOPT_FP8_CASES
-TWO_GPU_CASES = _with_default_num_gpus(TWO_GPU_CASES, 2)
+# Hardware acceptance policy (KubeTEE, 2026-10-16): Hopper (H100/H200) is
+# DEPRECATED — the *_h100 MiniMax-H3 cases (minimax_h3_t2va_2gpu_h100,
+# minimax_h3_ref2va_video_audio_2gpu_h100) are retained in TWO_GPU_CASES above
+# for reference only and are filtered out here. Policy of record:
+# kubetee-subnet/docs/GPU-NODE-REQUIREMENTS.md.
+TWO_GPU_CASES = _with_default_num_gpus(
+    [case for case in TWO_GPU_CASES if not case.id.endswith("_h100")],
+    2,
+)
 
 
 def _select_5090_canary_cases(case_ids: tuple[str, ...]) -> list[DiffusionTestCase]:
@@ -1502,7 +1525,8 @@ def _select_xpu_cases(case_ids: tuple[str, ...]) -> list[DiffusionTestCase]:
     return [cases_by_id[case_id] for case_id in case_ids]
 
 
-# Consistency GT images are H100-generated; XPU output diverges at the
+# Consistency GT images are H100-generated (deprecated hardware — retained as
+# golden references only); XPU output diverges at the
 # pixel level (different attention kernels + fp reductions on Xe2) so
 # SSIM/PSNR against the H100 golden always fails. test_server_1_gpu.py
 # parametrizes directly from ONE_GPU_CASES, so mutate those entries in
@@ -1572,9 +1596,9 @@ FILE_SUITES = {
     "1-gpu-b200": [
         "test_server_b200.py",
     ],
-    "4-gpu-h100": [
-        "test_server_4_gpu_h100.py",
-    ],
+    # "4-gpu-h100": [  # Hopper deprecated (KubeTEE, 2026-10-16) — suite disabled
+    #     "test_server_4_gpu_h100.py",
+    # ],
 }
 
 PARAMETRIZED_CASE_GROUPS = {
