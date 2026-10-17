@@ -40,6 +40,13 @@
 #     or EXACTLY `tag_prefix` (+ `mimo-cu13-latest`) when tag_prefix is set.
 #   * Base image + source SHA are `workflow_dispatch` inputs so a bump is just
 #     a re-run with new `-f` values; no code change.
+#   * BASE-PULL FRAGILITY (2026-10-17): the multi-GB lmsysorg base pull has
+#     failed 4/7 runs today at the COPY/WORKDIR "compute cache key" stage with
+#     pure transport errors, zero code involved — HTTP/2 stream CANCEL, AFD
+#     HTML 400, TCP RST (runs 1-3, before cache removal), and now `local error:
+#     tls: bad record MAC` (run 39022079358, 27 min in at 4.44/4.53 GB). It is
+#     transient: re-dispatch the identical run and it goes through (run 5 /
+#     run 39023806300 both did). Do NOT misread it as a Dockerfile/patch error.
 #   * SOURCE POLICY: the dsv41 variant layers UNMODIFIED upstream source (no
 #     cherry-picks, no self-authored patches — that rule stays). The mimo
 #     variant exists precisely to carry upstream-AUTHORED but UNMERGED PR
