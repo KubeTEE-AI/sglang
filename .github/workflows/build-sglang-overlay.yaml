@@ -20,7 +20,7 @@
 # RUN IT (dsv41 overlay — merged upstream source at sglang_sha):
 #   gh workflow run build-sglang-overlay.yaml \
 #       --repo KubeTEE-AI/sglang \
-#       -f sglang_sha=86cc2e02ecb207853377e2c034337e9e0442ce60
+#       -f sglang_sha=a126e8d640c707f855e8da31f906035883f4ff70
 #
 # RUN IT (mimo overlay — base source + unmerged patches; currently PR #43518,
 # the MiMo DFlash/DSpark stale-grammar-mask verify loop, issue #43514):
@@ -74,7 +74,7 @@ on:
       sglang_sha:
         description: "[dsv41] UNMODIFIED upstream sgl-project/sglang commit SHA to layer"
         required: false
-        default: "86cc2e02ecb207853377e2c034337e9e0442ce60"
+        default: "a126e8d640c707f855e8da31f906035883f4ff70"
       source_sha:
         description: "[mimo] upstream SHA the base image was built from (patch target + provenance)"
         required: false
@@ -144,12 +144,21 @@ jobs:
           echo "primary=${REGISTRY}/${IMAGE_NAME}:${PRIMARY}" >> "$GITHUB_OUTPUT"
           echo "alias=${REGISTRY}/${IMAGE_NAME}:${KEY}-latest" >> "$GITHUB_OUTPUT"
 
-      - name: Build and push (linux/amd64)
+      # Build (no push) then push in a retry loop — 2026-10-17: the multi-GB
+      # ghcr blob UPLOAD dropped twice mid-stream ("use of closed network
+      # connection", different blobs each time: runs 39036644066 / 39039884211),
+      # the upload-direction twin of the base-pull fragility documented below.
+      # `push: true` couples build+push in one step, so a drop costs the whole
+      # ~45-min run. Split: build --load (local docker), then `docker push` in a
+      # retry loop — a push HEAD-checks already-uploaded blobs and resumes only
+      # the missing ones, so retries are cheap and incremental.
+      - name: Build (linux/amd64, local)
         uses: docker/build-push-action@v5
         with:
           context: .                             # workspace root: overlay/ + sglang-src/
           file: ${{ inputs.variant == 'mimo' && 'overlay/docker/kubetee-mimo-overlay/Dockerfile' || 'overlay/docker/kubetee-overlay/Dockerfile' }}
-          push: true
+          push: false
+          load: true
           platforms: linux/amd64
           build-args: |
             BASE_IMAGE=${{ inputs.base_image }}
@@ -163,6 +172,20 @@ jobs:
           # parsed as JSON) while the upstream Actions cache backend was
           # degraded. The build compiles nothing (pure source-layer overlay),
           # so a cold build is fast; cache is not worth the fragility.
+
+      - name: Push with retry (ghcr blob uploads drop mid-stream)
+        run: |
+          set -uo pipefail
+          for i in 1 2 3 4 5 6; do
+            if docker push "${{ steps.tags.outputs.primary }}"; then
+              docker push "${{ steps.tags.outputs.alias }}" || true
+              exit 0
+            fi
+            echo "push attempt $i failed; sleeping $((i*30))s before retry" >&2
+            sleep $((i*30))
+          done
+          echo "push failed after 6 attempts" >&2
+          exit 1
 
       - name: Print image digest
         run: |

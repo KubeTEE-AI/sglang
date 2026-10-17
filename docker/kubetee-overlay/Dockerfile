@@ -7,7 +7,7 @@
 # SOURCE POLICY: SGLANG_SHA is an UNMODIFIED upstream `sgl-project/sglang`
 # commit (no cherry-picks, no self-authored patches). Default = the commit that
 # unbreaks the upstream nightly build AND contains the 4 fixes we want:
-#   86cc2e02ecb207853377e2c034337e9e0442ce60
+#   a126e8d640c707f855e8da31f906035883f4ff70
 #     (#44720 zip-yank build fix + #41303 bounded-replay correctness
 #      + #44783 + #44403 + #43813)
 # Bumping = change SGLANG_SHA to a newer upstream commit and rebuild.
@@ -51,7 +51,7 @@
 #     startupProbe allows it.)
 
 ARG BASE_IMAGE=lmsysorg/sglang:nightly-dev-cu13-20261016-a93f16f0@sha256:0b3e39704480c423d8a00ca15ebee63154defc62944df2d4b11c594563bab457
-ARG SGLANG_SHA=86cc2e02ecb207853377e2c034337e9e0442ce60
+ARG SGLANG_SHA=a126e8d640c707f855e8da31f906035883f4ff70
 
 FROM ${BASE_IMAGE}
 
