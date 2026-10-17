@@ -66,18 +66,22 @@ WORKDIR /sgl-workspace
 ENV SGLANG_BUILD_COMMIT=${SGLANG_SHA} \
     SGLANG_RUST_BUILD_MODE=never
 
-# 1) Fetch the UNMODIFIED upstream source at SGLANG_SHA (shallow tarball — no
-#    git history, so no local edits are possible).
-ADD https://github.com/sgl-project/sglang/archive/${SGLANG_SHA}.tar.gz /tmp/sglang.tar.gz
+# 1) Receive the UNMODIFIED upstream source at SGLANG_SHA as build context
+#    (`sglang-src/`, checked out at exactly SGLANG_SHA by the workflow via git).
+#    History: this used to be `ADD https://github.com/.../archive/<sha>.tar.gz`;
+#    three consecutive build failures (runs 39010741205 / 39011904888 /
+#    39014325235: HTTP/2 stream CANCEL, Azure-Front-Door HTML 400, TCP RST —
+#    all inside BuildKit's remote-URL cache-key fetch) showed the anonymous
+#    codeload fetch is not reliable from the build container. git checkout in
+#    the workflow is (worked in every run), and gives exact-SHA provenance.
+COPY sglang-src /tmp/sglang-src
 
 # 2) Preserve compiled .so, replace the editable source tree, stub the missing
 #    README/LICENSE, then reinstall the Python package pure-Python.
 RUN set -eu; \
     # -- locate the pinned source --------------------------------------------
-    tar -xzf /tmp/sglang.tar.gz -C /tmp; \
-    rm -f /tmp/sglang.tar.gz; \
-    SRC="/tmp/sglang-${SGLANG_SHA}"; \
-    [ -d "$SRC" ] || { echo "FATAL: expected source dir $SRC"; ls /tmp; exit 1; }; \
+    SRC="/tmp/sglang-src"; \
+    [ -d "$SRC/python/sglang" ] || { echo "FATAL: $SRC does not look like the sglang source"; ls "$SRC"; exit 1; }; \
     OLD=/sgl-workspace/sglang; \
     # -- preserve EVERY compiled .so in the package (Rust PyO3 extensions the
     #    serving path imports), by relative path, across the tree swap --------
