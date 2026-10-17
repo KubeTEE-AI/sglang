@@ -51,6 +51,24 @@ jobs:
     steps:
       - name: Checkout build repo (for Dockerfile)
         uses: actions/checkout@v4
+        with:
+          path: overlay
+
+      # The overlay builds UNMODIFIED upstream source at SGLANG_SHA. Fetch it
+      # here via git (exact-SHA, reliable) rather than as a remote `ADD` URL in
+      # the Dockerfile — the anonymous github.com archive fetch inside the
+      # build container failed 3/3 runs (stream CANCEL / AFD HTML 400 / TCP RST).
+      - name: Checkout upstream sglang at pinned SHA
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/sglang
+          ref: ${{ inputs.sglang_sha }}
+          path: sglang-src
+          fetch-depth: 1
+
+      - name: Trim build context (.git dirs)
+        run: |
+          printf '%s\n' 'overlay/.git' 'sglang-src/.git' '.git' > .dockerignore
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -74,8 +92,8 @@ jobs:
       - name: Build and push (linux/amd64)
         uses: docker/build-push-action@v5
         with:
-          context: docker/kubetee-overlay        # in the KubeTEE-AI/sglang fork
-          file: docker/kubetee-overlay/Dockerfile
+          context: .                             # workspace root: overlay/ + sglang-src/
+          file: overlay/docker/kubetee-overlay/Dockerfile
           push: true
           platforms: linux/amd64
           build-args: |
