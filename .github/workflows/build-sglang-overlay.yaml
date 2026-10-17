@@ -84,8 +84,12 @@ jobs:
           tags: |
             ${{ steps.tags.outputs.primary }}
             ${{ steps.tags.outputs.alias }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # NOTE: GHA build cache (type=gha) removed 2026-10-17 — two consecutive
+          # runs failed inside cache load/export (HTTP/2 stream CANCEL; then a
+          # 400 "Our services aren't available right now" HTML outage page
+          # parsed as JSON) while the upstream Actions cache backend was
+          # degraded. The build compiles nothing (pure source-layer overlay),
+          # so a cold build is fast; cache is not worth the fragility.
 
       - name: Print image digest
         run: |
