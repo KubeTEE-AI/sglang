@@ -1,0 +1,93 @@
+# GitHub Actions workflow — build the SGLang python-overlay image.
+#
+# WHERE IT RUNS: `KubeTEE-AI/sglang` (the org's sglang fork). It is a workflow
+# file — `uses: ./.github/workflows/*` and workflow triggers only work within
+# their own repo, so both this and the Dockerfile live in that fork. The
+# `nim/sglang-overlay/` copy here in kubetee-ai is the tracked template. The
+# fork is set up as:
+#   .github/workflows/build-sglang-overlay.yaml   (this file)
+#   docker/kubetee-overlay/Dockerfile             (the overlay)
+# The self-hosted runner `kubetee-side-aph5nt-MS-A2` is org-level and attached
+# to the fork (same runner the kata-deploy-shim-overlay / -ovmf builds use).
+# ghcr.io push uses `secrets.GITHUB_TOKEN` (the fork's `packages: write`).
+#
+# RUN IT:
+#   gh workflow run build-sglang-overlay.yaml \
+#       --repo KubeTEE-AI/sglang \
+#       -f sglang_sha=86cc2e02ecb207853377e2c034337e9e0442ce60
+#
+# DESIGN NOTES:
+#   * amd64 only (single-arch, matches `nightly-dev-cu13` consumption on H200).
+#   * Pushes to `ghcr.io/kubetee-ai/sglang` (NOT `lmsysorg/sglang` — that is
+#     upstream's Docker Hub org). The deploy manifest references ghcr.io.
+#   * Tags: `dsv41-<shortsha>-<date>` (immutable) + `dsv41-latest`.
+#   * Base image + SGLANG_SHA are `workflow_dispatch` inputs so a bump is just
+#     a re-run with a new `-f sglang_sha=...`; no code change.
+
+name: Build SGLang Overlay
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_image:
+        description: "Base sglang nightly image (digest-pin for reproducibility)"
+        required: false
+        default: "lmsysorg/sglang:nightly-dev-cu13-20261016-a93f16f0@sha256:0b3e39704480c423d8a00ca15ebee63154defc62944df2d4b11c594563bab457"
+      sglang_sha:
+        description: "UNMODIFIED upstream sgl-project/sglang commit SHA to layer"
+        required: true
+        default: "86cc2e02ecb207853377e2c034337e9e0442ce60"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: kubetee-ai/sglang
+
+jobs:
+  build-and-push:
+    runs-on: [self-hosted, Linux, X64]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout build repo (for Dockerfile)
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to ghcr.io
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        run: |
+          SHA="${{ inputs.sglang_sha }}"
+          SHORT="${SHA:0:8}"
+          DATE="$(date -u +%Y%m%d)"
+          echo "primary=${REGISTRY}/${IMAGE_NAME}:dsv41-${SHORT}-${DATE}" >> "$GITHUB_OUTPUT"
+          echo "alias=${REGISTRY}/${IMAGE_NAME}:dsv41-latest" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push (linux/amd64)
+        uses: docker/build-push-action@v5
+        with:
+          context: docker/kubetee-overlay        # in the KubeTEE-AI/sglang fork
+          file: docker/kubetee-overlay/Dockerfile
+          push: true
+          platforms: linux/amd64
+          build-args: |
+            BASE_IMAGE=${{ inputs.base_image }}
+            SGLANG_SHA=${{ inputs.sglang_sha }}
+          tags: |
+            ${{ steps.tags.outputs.primary }}
+            ${{ steps.tags.outputs.alias }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Print image digest
+        run: |
+          echo "Built ${{ steps.tags.outputs.primary }}"
+          docker buildx imagetools inspect "${{ steps.tags.outputs.primary }}" || true
