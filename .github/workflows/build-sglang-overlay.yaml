@@ -1,0 +1,170 @@
+# GitHub Actions workflow — build the SGLang python-overlay images.
+#
+# WHERE IT RUNS: `KubeTEE-AI/sglang` (the org's sglang fork). It is a workflow
+# file — `uses: ./.github/workflows/*` and workflow triggers only work within
+# their own repo, so this and the Dockerfiles live in that fork. The
+# `nim/sglang-overlay/` copy here in kubetee-ai is the tracked template. The
+# fork is set up as:
+#   .github/workflows/build-sglang-overlay.yaml   (this file)
+#   docker/kubetee-overlay/Dockerfile             (dsv41 overlay — replaces the
+#                                                  base source tree with an
+#                                                  UNMODIFIED upstream commit)
+#   docker/kubetee-mimo-overlay/Dockerfile        (mimo overlay — keeps the base
+#                                                  source byte-stable and applies
+#                                                  UNMERGED upstream PR patches)
+#   docker/kubetee-mimo-overlay/patches/*.patch   (the patch set, applied in-image)
+# The self-hosted runner `kubetee-side-aph5nt-MS-A2` is org-level and attached
+# to the fork (same runner the kata-deploy-shim-overlay / -ovmf builds use).
+# ghcr.io push uses `secrets.GITHUB_TOKEN` (the fork's `packages: write`).
+#
+# RUN IT (dsv41 overlay — merged upstream source at sglang_sha):
+#   gh workflow run build-sglang-overlay.yaml \
+#       --repo KubeTEE-AI/sglang \
+#       -f sglang_sha=a126e8d640c707f855e8da31f906035883f4ff70
+#
+# RUN IT (mimo overlay — base source + unmerged patches; currently PR #43518,
+# the MiMo DFlash/DSpark stale-grammar-mask verify loop, issue #43514):
+#   gh workflow run build-sglang-overlay.yaml \
+#       --repo KubeTEE-AI/sglang \
+#       -f variant=mimo \
+#       -f tag_prefix=mimo-cu13-20261016-43518fix1
+#   (source_sha defaults to ed8c3139 — the build commit of the base_image
+#    default, nightly-dev-cu13-20261016-a93f16f0; override both together.)
+#
+# DESIGN NOTES:
+#   * amd64 only (single-arch, matches `nightly-dev-cu13` consumption on H200).
+#   * Pushes to `ghcr.io/kubetee-ai/sglang` (NOT `lmsysorg/sglang` — that is
+#     upstream's Docker Hub org). The deploy manifest references ghcr.io.
+#   * variant=dsv41: tags `dsv41-<shortsha>-<date>` (immutable) + `dsv41-latest`.
+#     variant=mimo: tags `mimo-cu13-<shortsha>-<date>` + `mimo-cu13-latest`,
+#     or EXACTLY `tag_prefix` (+ `mimo-cu13-latest`) when tag_prefix is set.
+#   * Base image + source SHA are `workflow_dispatch` inputs so a bump is just
+#     a re-run with new `-f` values; no code change.
+#   * BASE-PULL FRAGILITY (2026-10-17): the multi-GB lmsysorg base pull has
+#     failed 4/7 runs today at the COPY/WORKDIR "compute cache key" stage with
+#     pure transport errors, zero code involved — HTTP/2 stream CANCEL, AFD
+#     HTML 400, TCP RST (runs 1-3, before cache removal), and now `local error:
+#     tls: bad record MAC` (run 39022079358, 27 min in at 4.44/4.53 GB). It is
+#     transient: re-dispatch the identical run and it goes through (run 5 /
+#     run 39023806300 both did). Do NOT misread it as a Dockerfile/patch error.
+#   * SOURCE POLICY: the dsv41 variant layers UNMODIFIED upstream source (no
+#     cherry-picks, no self-authored patches — that rule stays). The mimo
+#     variant exists precisely to carry upstream-AUTHORED but UNMERGED PR
+#     patches (#43518) until they merge; we author nothing, we ship their diff.
+#     On merge day: delete the patch (or just bump to the nightly containing
+#     the merge), rebuild variant=mimo with no patches or variant=dsv41, and
+#     retire the mimo Dockerfile. See the mimo Dockerfile header for the full
+#     rationale (recorded in nim/mimo-v2-6-pro-rl-sglang-b200-cc.yaml).
+
+name: Build SGLang Overlay
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "dsv41 = replace source at sglang_sha (merged upstream); mimo = base source + unmerged patches"
+        required: false
+        default: "dsv41"
+        type: choice
+        options: [dsv41, mimo]
+      base_image:
+        description: "Base sglang nightly image (digest-pin for reproducibility)"
+        required: false
+        default: "lmsysorg/sglang:nightly-dev-cu13-20261016-a93f16f0@sha256:0b3e39704480c423d8a00ca15ebee63154defc62944df2d4b11c594563bab457"
+      sglang_sha:
+        description: "[dsv41] UNMODIFIED upstream sgl-project/sglang commit SHA to layer"
+        required: false
+        default: "a126e8d640c707f855e8da31f906035883f4ff70"
+      source_sha:
+        description: "[mimo] upstream SHA the base image was built from (patch target + provenance)"
+        required: false
+        default: "ed8c3139f1f643544b68102cf8c44504e5e55e3d"
+      tag_prefix:
+        description: "Exact primary tag override (empty = computed <key>-<shortsha>-<date>)"
+        required: false
+        default: ""
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: kubetee-ai/sglang
+
+jobs:
+  build-and-push:
+    runs-on: [self-hosted, Linux, X64]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout build repo (for Dockerfiles + patch set)
+        uses: actions/checkout@v4
+        with:
+          path: overlay
+
+      # The dsv41 overlay builds UNMODIFIED upstream source at SGLANG_SHA (the
+      # mimo overlay patches the base's own tree and does not need this, but
+      # checking it out keeps provenance uniform). Fetch it here via git
+      # (exact-SHA, reliable) rather than as a remote `ADD` URL in the
+      # Dockerfile — the anonymous github.com archive fetch inside the
+      # build container failed 3/3 runs (stream CANCEL / AFD HTML 400 / TCP RST).
+      - name: Checkout upstream sglang at pinned SHA
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/sglang
+          ref: ${{ inputs.variant == 'mimo' && inputs.source_sha || inputs.sglang_sha }}
+          path: sglang-src
+          fetch-depth: 1
+
+      - name: Trim build context (.git dirs)
+        run: |
+          printf '%s\n' 'overlay/.git' 'sglang-src/.git' '.git' > .dockerignore
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to ghcr.io
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        run: |
+          VARIANT="${{ inputs.variant }}"
+          if [ "$VARIANT" = "mimo" ]; then
+            SHA="${{ inputs.source_sha }}"; KEY="mimo-cu13"
+          else
+            SHA="${{ inputs.sglang_sha }}"; KEY="dsv41"
+          fi
+          SHORT="${SHA:0:8}"
+          DATE="$(date -u +%Y%m%d)"
+          PRIMARY="${{ inputs.tag_prefix }}"
+          if [ -z "$PRIMARY" ]; then PRIMARY="${KEY}-${SHORT}-${DATE}"; fi
+          echo "primary=${REGISTRY}/${IMAGE_NAME}:${PRIMARY}" >> "$GITHUB_OUTPUT"
+          echo "alias=${REGISTRY}/${IMAGE_NAME}:${KEY}-latest" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push (linux/amd64)
+        uses: docker/build-push-action@v5
+        with:
+          context: .                             # workspace root: overlay/ + sglang-src/
+          file: ${{ inputs.variant == 'mimo' && 'overlay/docker/kubetee-mimo-overlay/Dockerfile' || 'overlay/docker/kubetee-overlay/Dockerfile' }}
+          push: true
+          platforms: linux/amd64
+          build-args: |
+            BASE_IMAGE=${{ inputs.base_image }}
+            SGLANG_SHA=${{ inputs.variant == 'mimo' && inputs.source_sha || inputs.sglang_sha }}
+          tags: |
+            ${{ steps.tags.outputs.primary }}
+            ${{ steps.tags.outputs.alias }}
+          # NOTE: GHA build cache (type=gha) removed 2026-10-17 — two consecutive
+          # runs failed inside cache load/export (HTTP/2 stream CANCEL; then a
+          # 400 "Our services aren't available right now" HTML outage page
+          # parsed as JSON) while the upstream Actions cache backend was
+          # degraded. The build compiles nothing (pure source-layer overlay),
+          # so a cold build is fast; cache is not worth the fragility.
+
+      - name: Print image digest
+        run: |
+          echo "Built ${{ steps.tags.outputs.primary }}"
+          docker buildx imagetools inspect "${{ steps.tags.outputs.primary }}" || true
