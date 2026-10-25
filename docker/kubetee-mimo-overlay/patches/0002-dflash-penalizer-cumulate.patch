@@ -1,0 +1,580 @@
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index fcbb02cf5f..a6ddcfc845 100644
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -1148,6 +1148,7 @@ class Req(ReqDllmMixin):
+         # Full-KV-derived boundary whose SWA window should be inserted after
+         # the current prefill pass.
+         self.swa_branching_seqlen: Optional[int] = None
++        self.penalty_cumulated_len = 0
+ 
+         # for cross-encoder model
+         self.token_type_ids = token_type_ids
+@@ -2108,6 +2109,7 @@ class Req(ReqDllmMixin):
+         self.already_computed = 0
+         assert not self.kv.holds_kv, "expect it is already released"
+         self.kv.kv_committed_len = 0
++        self.penalty_cumulated_len = 0
+         self.extend_batch_idx = 0
+         self.decode_batch_idx = 0
+ 
+@@ -3756,6 +3758,33 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+             latest_output_ids
+         )
+ 
++    def cumulate_penalty_output_tokens_since_last(self):
++        """Feed every output token committed since the previous call (all
++        accepted speculative tokens, not only the last) to the penalizers."""
++        new_tokens = []
++        for req in self.reqs:
++            new_tokens.append(req.output_ids[req.penalty_cumulated_len :])
++            req.penalty_cumulated_len = len(req.output_ids)
++
++        k = max((len(t) for t in new_tokens), default=0)
++        if k == 0:
++            return
++
++        pin_memory = is_pin_memory_available(self.device)
++        ids = torch.tensor(
++            [list(t) + [0] * (k - len(t)) for t in new_tokens],
++            dtype=torch.int64,
++            pin_memory=pin_memory,
++        )
++        num_valid = torch.tensor(
++            [len(t) for t in new_tokens], dtype=torch.int64, pin_memory=pin_memory
++        )
++
++        self.sampling_info.penalizer_orchestrator.cumulate_output_tokens_multi(
++            ids.to(self.device, non_blocking=True),
++            num_valid.to(self.device, non_blocking=True),
++        )
++
+     def prepare_for_decode(self):
+         self.forward_mode = ForwardMode.DECODE
+         self.mamba_track_seqlens_cpu = None
+diff --git a/python/sglang/srt/sampling/penaltylib/frequency_penalty.py b/python/sglang/srt/sampling/penaltylib/frequency_penalty.py
+index 5abeaf75cc..1bb99a9ad2 100644
+--- a/python/sglang/srt/sampling/penaltylib/frequency_penalty.py
++++ b/python/sglang/srt/sampling/penaltylib/frequency_penalty.py
+@@ -43,6 +43,17 @@ class BatchedFrequencyPenalizer(_BatchedPenalizer):
+             src=self.frequency_penalties,
+         )
+ 
++    def _cumulate_output_tokens_multi(
++        self, output_ids: torch.Tensor, num_valid: torch.Tensor
++    ):
++        _, k = output_ids.shape
++        valid = torch.arange(k, device=output_ids.device)[None, :] < num_valid[:, None]
++        self.cumulated_frequency_penalties.scatter_add_(
++            dim=1,
++            index=output_ids,
++            src=self.frequency_penalties.expand(-1, k) * valid,
++        )
++
+     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
+         logits.sub_(self.cumulated_frequency_penalties)
+ 
+diff --git a/python/sglang/srt/sampling/penaltylib/min_new_tokens.py b/python/sglang/srt/sampling/penaltylib/min_new_tokens.py
+index 51ad26cf47..64ed7c9ffa 100644
+--- a/python/sglang/srt/sampling/penaltylib/min_new_tokens.py
++++ b/python/sglang/srt/sampling/penaltylib/min_new_tokens.py
+@@ -82,6 +82,13 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
+     def _cumulate_output_tokens(self, output_ids: torch.Tensor):
+         self.len_output_tokens += 1
+ 
++    def _cumulate_output_tokens_multi(
++        self, output_ids: torch.Tensor, num_valid: torch.Tensor
++    ):
++        self.len_output_tokens += num_valid.to(
++            dtype=self.len_output_tokens.dtype
++        ).reshape_as(self.len_output_tokens)
++
+     def _apply(self, logits: torch.Tensor):
+         # Boolean-mask indexing (logits[mask]) is data-dependent and forces a
+         # device-to-host sync every decode step; torch.where is a plain
+diff --git a/python/sglang/srt/sampling/penaltylib/orchestrator.py b/python/sglang/srt/sampling/penaltylib/orchestrator.py
+index 5cdbe83fa6..d73f51356b 100644
+--- a/python/sglang/srt/sampling/penaltylib/orchestrator.py
++++ b/python/sglang/srt/sampling/penaltylib/orchestrator.py
+@@ -10,6 +10,26 @@ if TYPE_CHECKING:
+     from sglang.srt.managers.schedule_batch import ScheduleBatch
+ 
+ 
++def scatter_row_penalty(
++    target: torch.Tensor,
++    output_ids: torch.Tensor,
++    num_valid: torch.Tensor,
++    penalties: torch.Tensor,
++):
++    """Set `target[i, output_ids[i, j]] = penalties[i]` for `j < num_valid[i]`."""
++    k = output_ids.shape[1]
++    valid = torch.arange(k, device=output_ids.device)[None, :] < num_valid[:, None]
++    # Padded slots repeat the row's first token, so every write in a non-empty
++    # row stores the same value; empty rows write back what they already hold.
++    index = torch.where(valid, output_ids, output_ids[:, :1])
++    src = torch.where(
++        num_valid[:, None] > 0,
++        penalties.expand(-1, k),
++        target.gather(1, index),
++    )
++    target.scatter_(1, index, src)
++
++
+ class BatchedPenalizerOrchestrator:
+     def __init__(
+         self,
+@@ -52,6 +72,15 @@ class BatchedPenalizerOrchestrator:
+         for penalizer in self.penalizers.values():
+             penalizer.cumulate_output_tokens(output_ids=output_ids)
+ 
++    def cumulate_output_tokens_multi(
++        self, output_ids: torch.Tensor, num_valid: torch.Tensor
++    ):
++        """Feed multiple committed output tokens per request to the penalizers."""
++        for penalizer in self.penalizers.values():
++            penalizer.cumulate_output_tokens_multi(
++                output_ids=output_ids, num_valid=num_valid
++            )
++
+     def apply(self, logits: torch.Tensor, repeat: Optional[int] = None):
+         """
+         Apply all penalizers to the logits in-place.
+@@ -215,6 +244,14 @@ class _BatchedPenalizer(abc.ABC):
+ 
+         self._cumulate_output_tokens(output_ids=output_ids)
+ 
++    def cumulate_output_tokens_multi(
++        self, output_ids: torch.Tensor, num_valid: torch.Tensor
++    ):
++        if not self._is_prepared:
++            return
++
++        self._cumulate_output_tokens_multi(output_ids=output_ids, num_valid=num_valid)
++
+     def apply(self, logits: torch.Tensor) -> torch.Tensor:
+         if not self._is_prepared:
+             return
+@@ -258,6 +295,16 @@ class _BatchedPenalizer(abc.ABC):
+         """
+         pass
+ 
++    @abc.abstractmethod
++    def _cumulate_output_tokens_multi(
++        self, output_ids: torch.Tensor, num_valid: torch.Tensor
++    ):
++        """
++        Cumulate up to `output_ids.shape[1]` output tokens per request; only the
++        first `num_valid[i]` tokens of row i are real.
++        """
++        pass
++
+     @abc.abstractmethod
+     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
+         """
+diff --git a/python/sglang/srt/sampling/penaltylib/presence_penalty.py b/python/sglang/srt/sampling/penaltylib/presence_penalty.py
+index 5d6004eb6a..dcab6108c7 100644
+--- a/python/sglang/srt/sampling/penaltylib/presence_penalty.py
++++ b/python/sglang/srt/sampling/penaltylib/presence_penalty.py
+@@ -1,6 +1,9 @@
+ import torch
+ 
+-from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
++from sglang.srt.sampling.penaltylib.orchestrator import (
++    _BatchedPenalizer,
++    scatter_row_penalty,
++)
+ from sglang.srt.utils.common import is_pin_memory_available
+ 
+ 
+@@ -43,6 +46,16 @@ class BatchedPresencePenalizer(_BatchedPenalizer):
+             src=self.presence_penalties,
+         )
+ 
++    def _cumulate_output_tokens_multi(
++        self, output_ids: torch.Tensor, num_valid: torch.Tensor
++    ):
++        scatter_row_penalty(
++            self.cumulated_presence_penalties,
++            output_ids,
++            num_valid,
++            self.presence_penalties,
++        )
++
+     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
+         logits.sub_(self.cumulated_presence_penalties)
+ 
+diff --git a/python/sglang/srt/sampling/penaltylib/repetition_penalty.py b/python/sglang/srt/sampling/penaltylib/repetition_penalty.py
+index 7d58918195..175a1b660b 100644
+--- a/python/sglang/srt/sampling/penaltylib/repetition_penalty.py
++++ b/python/sglang/srt/sampling/penaltylib/repetition_penalty.py
+@@ -1,6 +1,9 @@
+ import torch
+ 
+-from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
++from sglang.srt.sampling.penaltylib.orchestrator import (
++    _BatchedPenalizer,
++    scatter_row_penalty,
++)
+ from sglang.srt.utils import get_compiler_backend, is_npu
+ from sglang.srt.utils.common import is_pin_memory_available
+ 
+@@ -56,6 +59,16 @@ class BatchedRepetitionPenalizer(_BatchedPenalizer):
+             src=self.repetition_penalties,
+         )
+ 
++    def _cumulate_output_tokens_multi(
++        self, output_ids: torch.Tensor, num_valid: torch.Tensor
++    ):
++        scatter_row_penalty(
++            self.cumulated_repetition_penalties,
++            output_ids,
++            num_valid,
++            self.repetition_penalties,
++        )
++
+     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
+         apply_scaling_penalties(logits, self.cumulated_repetition_penalties)
+         return logits
+diff --git a/python/sglang/srt/speculative/spec_utils.py b/python/sglang/srt/speculative/spec_utils.py
+index d2d1f31202..a58153ac55 100644
+--- a/python/sglang/srt/speculative/spec_utils.py
++++ b/python/sglang/srt/speculative/spec_utils.py
+@@ -1264,6 +1264,8 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
+             max_speculative_num_draft_tokens(),
+         )
+     if batch.spec_algorithm.is_dflash_family():
++        if batch.sampling_info.penalizer_orchestrator.is_required:
++            batch.cumulate_penalty_output_tokens_since_last()
+         batch.spec_info.prepare_for_decode(batch)
+     elif batch.spec_algorithm.is_uno():
+         from sglang.srt.speculative.uno_info import UnoDraftInput
+diff --git a/test/registered/unit/spec/test_dflash_penalizer_cumulate.py b/test/registered/unit/spec/test_dflash_penalizer_cumulate.py
+new file mode 100644
+index 0000000000..327f9ce7af
+--- /dev/null
++++ b/test/registered/unit/spec/test_dflash_penalizer_cumulate.py
+@@ -0,0 +1,324 @@
++import unittest
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++import torch
++
++from sglang.srt.managers.schedule_batch import ScheduleBatch
++from sglang.srt.sampling.penaltylib.frequency_penalty import (
++    BatchedFrequencyPenalizer,
++)
++from sglang.srt.sampling.penaltylib.min_new_tokens import (
++    BatchedMinNewTokensPenalizer,
++)
++from sglang.srt.sampling.penaltylib.orchestrator import (
++    BatchedPenalizerOrchestrator,
++)
++from sglang.srt.sampling.penaltylib.presence_penalty import (
++    BatchedPresencePenalizer,
++)
++from sglang.srt.sampling.penaltylib.repetition_penalty import (
++    BatchedRepetitionPenalizer,
++)
++from sglang.srt.sampling.sampling_params import SamplingParams
++from sglang.srt.speculative import spec_utils
++from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
++from sglang.test.ci.ci_register import register_cpu_ci
++from sglang.test.test_utils import CustomTestCase
++
++register_cpu_ci(est_time=5, suite="base-a-test-cpu")
++
++
++def _make_req(
++    *,
++    repetition_penalty=1.0,
++    frequency_penalty=0.0,
++    presence_penalty=0.0,
++    min_new_tokens=0,
++):
++    return SimpleNamespace(
++        sampling_params=SamplingParams(
++            repetition_penalty=repetition_penalty,
++            frequency_penalty=frequency_penalty,
++            presence_penalty=presence_penalty,
++            min_new_tokens=min_new_tokens,
++        ),
++        tokenizer=SimpleNamespace(
++            additional_stop_token_ids=None,
++            eos_token_id=2,
++        ),
++        eos_token_ids=None,
++        penalty_cumulated_len=0,
++    )
++
++
++def _make_batch(reqs):
++    class FakeBatch:
++        pass
++
++    batch = FakeBatch()
++    batch.reqs = reqs
++    batch.device = torch.device("cpu")
++    return batch
++
++
++def _make_orchestrator(reqs, vocab_size=16):
++    return BatchedPenalizerOrchestrator(
++        vocab_size,
++        _make_batch(reqs),
++        {
++            BatchedFrequencyPenalizer,
++            BatchedMinNewTokensPenalizer,
++            BatchedPresencePenalizer,
++            BatchedRepetitionPenalizer,
++        },
++    )
++
++
++class TestDFlashPenalizerCumulate(CustomTestCase):
++    def test_multi_token_cumulate_updates_all_penalties_and_masks_padding(self):
++        reqs = [
++            _make_req(
++                repetition_penalty=1.5,
++                frequency_penalty=0.3,
++                presence_penalty=0.2,
++                min_new_tokens=4,
++            ),
++            _make_req(
++                repetition_penalty=1.5,
++                frequency_penalty=0.3,
++                presence_penalty=0.2,
++                min_new_tokens=4,
++            ),
++        ]
++        orchestrator = _make_orchestrator(reqs)
++        orchestrator.cumulate_output_tokens_multi(
++            torch.tensor([[5, 7, 7], [9, 0, 0]], dtype=torch.int64),
++            torch.tensor([3, 1], dtype=torch.int64),
++        )
++
++        repetition = orchestrator.penalizers[BatchedRepetitionPenalizer]
++        frequency = orchestrator.penalizers[BatchedFrequencyPenalizer]
++        presence = orchestrator.penalizers[BatchedPresencePenalizer]
++        min_new = orchestrator.penalizers[BatchedMinNewTokensPenalizer]
++
++        assert repetition.cumulated_repetition_penalties[0, 5] == 1.5
++        assert repetition.cumulated_repetition_penalties[0, 7] == 1.5
++        assert repetition.cumulated_repetition_penalties[1, 9] == 1.5
++        assert repetition.cumulated_repetition_penalties[1, 0] == 1.0
++        assert frequency.cumulated_frequency_penalties[0, 5] == 0.3
++        assert frequency.cumulated_frequency_penalties[0, 7] == 0.6
++        assert frequency.cumulated_frequency_penalties[1, 9] == 0.3
++        assert frequency.cumulated_frequency_penalties[1, 0] == 0.0
++        assert presence.cumulated_presence_penalties[0, 5] == 0.2
++        assert presence.cumulated_presence_penalties[0, 7] == 0.2
++        assert presence.cumulated_presence_penalties[1, 9] == 0.2
++        assert presence.cumulated_presence_penalties[1, 0] == 0.0
++        assert torch.equal(
++            min_new.len_output_tokens[:, 0], torch.tensor([3, 1], dtype=torch.int32)
++        )
++
++        states = (
++            repetition.cumulated_repetition_penalties,
++            frequency.cumulated_frequency_penalties,
++            presence.cumulated_presence_penalties,
++            min_new.len_output_tokens,
++        )
++        before = [state.clone() for state in states]
++        orchestrator.cumulate_output_tokens_multi(
++            torch.tensor([[0, 0], [0, 0]], dtype=torch.int64),
++            torch.tensor([0, 0], dtype=torch.int64),
++        )
++        for state, expected in zip(states, before):
++            assert torch.equal(state, expected)
++
++    def test_multi_token_matches_single_token_cumulate(self):
++        reqs = [
++            _make_req(
++                repetition_penalty=1.5,
++                frequency_penalty=0.3,
++                presence_penalty=0.2,
++                min_new_tokens=4,
++            ),
++            _make_req(
++                repetition_penalty=1.5,
++                frequency_penalty=0.3,
++                presence_penalty=0.2,
++                min_new_tokens=4,
++            ),
++        ]
++        multi = _make_orchestrator(reqs)
++        single = _make_orchestrator(
++            [
++                _make_req(
++                    repetition_penalty=1.5,
++                    frequency_penalty=0.3,
++                    presence_penalty=0.2,
++                    min_new_tokens=4,
++                ),
++                _make_req(
++                    repetition_penalty=1.5,
++                    frequency_penalty=0.3,
++                    presence_penalty=0.2,
++                    min_new_tokens=4,
++                ),
++            ]
++        )
++        ids = torch.tensor([[5, 7], [9, 9]], dtype=torch.int64)
++        multi.cumulate_output_tokens_multi(ids, torch.tensor([2, 2]))
++        for column in range(ids.shape[1]):
++            single.cumulate_output_tokens(ids[:, column])
++
++        for penalizer_type, attrs in (
++            (
++                BatchedRepetitionPenalizer,
++                ("cumulated_repetition_penalties",),
++            ),
++            (BatchedFrequencyPenalizer, ("cumulated_frequency_penalties",)),
++            (BatchedPresencePenalizer, ("cumulated_presence_penalties",)),
++            (BatchedMinNewTokensPenalizer, ("len_output_tokens",)),
++        ):
++            for attr in attrs:
++                assert torch.equal(
++                    getattr(multi.penalizers[penalizer_type], attr),
++                    getattr(single.penalizers[penalizer_type], attr),
++                )
++
++    def test_schedule_batch_penalty_cursor_feeds_only_new_tokens(self):
++        req0 = SimpleNamespace(
++            origin_input_ids=[10, 42],
++            output_ids=[1, 2, 3],
++            penalty_cumulated_len=0,
++        )
++        req1 = SimpleNamespace(
++            origin_input_ids=[20, 43], output_ids=[9], penalty_cumulated_len=0
++        )
++        orchestrator = MagicMock()
++
++        class FakeBatch:
++            pass
++
++        batch = FakeBatch()
++        batch.reqs = [req0, req1]
++        batch.device = torch.device("cpu")
++        batch.sampling_info = SimpleNamespace(penalizer_orchestrator=orchestrator)
++
++        ScheduleBatch.cumulate_penalty_output_tokens_since_last(batch)
++        ids, num_valid = orchestrator.cumulate_output_tokens_multi.call_args.args
++        assert torch.equal(ids, torch.tensor([[1, 2, 3], [9, 0, 0]]))
++        assert torch.equal(num_valid, torch.tensor([3, 1]))
++
++        orchestrator.reset_mock()
++        req0.output_ids.extend([4, 5])
++        ScheduleBatch.cumulate_penalty_output_tokens_since_last(batch)
++        ids, num_valid = orchestrator.cumulate_output_tokens_multi.call_args.args
++        assert torch.equal(ids, torch.tensor([[4, 5], [0, 0]]))
++        assert torch.equal(num_valid, torch.tensor([2, 0]))
++
++        orchestrator.reset_mock()
++        ScheduleBatch.cumulate_penalty_output_tokens_since_last(batch)
++        orchestrator.cumulate_output_tokens_multi.assert_not_called()
++
++    def test_verify_adjustments_apply_repetition_to_logits(self):
++        reqs = [_make_req(repetition_penalty=2.0), _make_req()]
++        orchestrator = _make_orchestrator(reqs, vocab_size=4)
++        orchestrator.cumulate_output_tokens_multi(
++            torch.tensor([[1, 3]], dtype=torch.int64).expand(2, -1),
++            torch.tensor([2, 2], dtype=torch.int64),
++        )
++
++        class FakeSamplingInfo:
++            has_custom_logit_processor = False
++            penalizer_orchestrator = orchestrator
++            grammar_mask = None
++            logit_bias = None
++            acc_scaling_penalties = None
++            apply_logits_bias = staticmethod(orchestrator.apply)
++
++            def __len__(self):
++                return 2
++
++        sampling_info = FakeSamplingInfo()
++        draft_token_num = 3
++        logits = torch.tensor([[1.0, 4.0, 1.0, -4.0]]).repeat(2 * draft_token_num, 1)
++
++        apply_dflash_verify_logits_adjustments(
++            next_token_logits=logits,
++            sampling_info=sampling_info,
++            draft_token_num=draft_token_num,
++        )
++
++        expected = torch.tensor(
++            [[1.0, 2.0, 1.0, -8.0]] * draft_token_num
++            + [[1.0, 4.0, 1.0, -4.0]] * draft_token_num
++        )
++        assert torch.equal(logits, expected)
++
++    def test_verify_adjustments_add_logit_bias_after_repetition(self):
++        reqs = [_make_req(repetition_penalty=2.0)]
++        orchestrator = _make_orchestrator(reqs, vocab_size=4)
++        orchestrator.cumulate_output_tokens_multi(
++            torch.tensor([[1]], dtype=torch.int64),
++            torch.tensor([1], dtype=torch.int64),
++        )
++
++        class FakeSamplingInfo:
++            has_custom_logit_processor = False
++            penalizer_orchestrator = orchestrator
++            grammar_mask = None
++            logit_bias = torch.tensor([[0.0, 10.0, 0.0, 0.0]])
++            acc_scaling_penalties = None
++
++            def __len__(self):
++                return 1
++
++        draft_token_num = 2
++        logits = torch.tensor([[1.0, 4.0, 1.0, -4.0]]).repeat(draft_token_num, 1)
++
++        apply_dflash_verify_logits_adjustments(
++            next_token_logits=logits,
++            sampling_info=FakeSamplingInfo(),
++            draft_token_num=draft_token_num,
++        )
++
++        expected = torch.tensor([[1.0, 12.0, 1.0, -4.0]] * draft_token_num)
++        assert torch.equal(logits, expected)
++
++    def test_spec_prepare_for_decode_gates_penalty_cumulate(self):
++        calls = []
++        batch = SimpleNamespace(
++            spec_algorithm=SimpleNamespace(is_dflash_family=lambda: True),
++            sampling_info=SimpleNamespace(
++                penalizer_orchestrator=SimpleNamespace(is_required=False)
++            ),
++            spec_info=SimpleNamespace(
++                prepare_for_decode=lambda _: calls.append("prepare")
++            ),
++            cumulate_penalty_output_tokens_since_last=lambda: calls.append("cumulate"),
++        )
++
++        with patch.object(
++            spec_utils,
++            "get_exec",
++            return_value=SimpleNamespace(
++                mamba=SimpleNamespace(enable_mamba_extra_buffer_lazy=False)
++            ),
++        ):
++            spec_utils.spec_prepare_for_decode(batch)
++        assert calls == ["prepare"]
++
++        calls.clear()
++        batch.sampling_info.penalizer_orchestrator.is_required = True
++        with patch.object(
++            spec_utils,
++            "get_exec",
++            return_value=SimpleNamespace(
++                mamba=SimpleNamespace(enable_mamba_extra_buffer_lazy=False)
++            ),
++        ):
++            spec_utils.spec_prepare_for_decode(batch)
++        assert calls == ["cumulate", "prepare"]
++
++
++if __name__ == "__main__":
++    unittest.main()
