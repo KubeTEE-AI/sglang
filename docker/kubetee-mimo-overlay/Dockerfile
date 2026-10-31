@@ -52,14 +52,17 @@
 #     no Rust .so involvement. Inherits SGLANG_RUST_BUILD_MODE=never (base's bundled
 #     Rust .so is trusted at runtime; see the kubetee-overlay header).
 #
-# BASE IMAGE: lmsysorg/sglang:nightly-dev-cu13-20261025-65633129
-# (build commit 656331295619a4d0267b40b7da0b5cd5b549fcbc) — contains the five
-# required merged PRs (#36810 Blackwell-CC overlap, #43054 verify-mask policy,
-# #43106 MiMo verify RoPE/KV fuse, #44568, #42565). Verified base-healthy on
-# mimo-v2-6-pro-rl-sglang-b200-cc-1 on 2026-10-25 before this build.
+# BASE IMAGE: lmsysorg/sglang:nightly-dev-cu13-20261031-a2cafa56
+# (build commit a2cafa56766cdd7a8c51f04008bdc0fbb1b64ebb — #38565 deterministic
+# top-p/top-k renorm when tp_size > 1, the TP-rank divergence in DFlash/DSpark) —
+# contains the five required merged PRs (#36810 Blackwell-CC overlap, #43054
+# verify-mask policy, #43106 MiMo verify RoPE/KV fuse, #44568, #42565) PLUS
+# #38565. penfix1-r2: 0002's schedule_batch.py hunk context regenerated for this
+# base's `reset_for_retract()` refactor (one trivial resolution); 0001 + 0003
+# apply byte-exact unchanged.
 
-ARG BASE_IMAGE=lmsysorg/sglang:nightly-dev-cu13-20261025-65633129@sha256:069efa1d6a2d58309529f53eeee34c39d69b1cdb455eaf7fb8de83e3fd0be727
-ARG SGLANG_SHA=656331295619a4d0267b40b7da0b5cd5b549fcbc
+ARG BASE_IMAGE=lmsysorg/sglang:nightly-dev-cu13-20261031-a2cafa56@sha256:dc254d8c80e91d65ff332275dc68c59bafd664035b4b596b6969e25011159ca2
+ARG SGLANG_SHA=a2cafa56766cdd7a8c51f04008bdc0fbb1b64ebb
 
 FROM ${BASE_IMAGE}
 
@@ -94,7 +97,7 @@ RUN set -eu; \
       [ -f "$f" ] || { echo "FATAL: ${p} patch missing"; exit 1; }; \
     done; \
     echo "--- preimage drift tripwire (base @ ${SGLANG_SHA})"; \
-    echo "72270b7d4e01012e4b0d04b283db0f57120be37ea0c94c820056ad9a5a9a0d5a  $DF" | sha256sum -c -; \
+    echo "26297110adb60cb3e361f14774f491caaefe1537fb7a913993e81ebe1aa8c913  $DF" | sha256sum -c -; \
     echo "--- applying patch set 0001 -> 0002 -> 0003"; \
     for p in 0001 0002 0003; do \
       f=$(ls /tmp/patches/${p}-*.patch); \
@@ -106,9 +109,9 @@ RUN set -eu; \
       fi; \
     done; \
     echo "--- postimage drift tripwire (+ #43518 + #41738 + reconcile)"; \
-    echo "cd523d11de3bca8524863df10b656192ac84dab6de900734c794cbfd55404a9a  $DF" | sha256sum -c -; \
-    echo "e5efab1ed54c60d1c551b780c6ff571b520f30a55bb32367f5c8e00215fd6cdc  $SB" | sha256sum -c -; \
-    echo "0d9b8353fb0231383950a3b9e2ddcd8cdcf68a05bbb6fc84106d274615c09409  $SU" | sha256sum -c -; \
+    echo "43c2bfd2f186b605d83d7cd1460a48a4bb29f9911b48b1011571c6105927747c  $DF" | sha256sum -c -; \
+    echo "8f09a58c5f2128e24ac53681090b7993091294725981d1041dfe68b78184a5ba  $SB" | sha256sum -c -; \
+    echo "ef379d691084787db38d5c33400af5bb335efe632e36ef72470e91c41fe2fd73  $SU" | sha256sum -c -; \
     echo "--- smoke check: the two upstream unit tests against the patched tree"; \
     cd "$ROOT/test/registered/unit/spec"; \
     /opt/sglang/bin/python -m unittest test_dflash_verify_grammar_mask test_dflash_penalizer_cumulate -v

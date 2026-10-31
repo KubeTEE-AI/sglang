@@ -3,7 +3,7 @@
 # WHERE IT RUNS: `KubeTEE-AI/sglang` (the org's sglang fork). It is a workflow
 # file — `uses: ./.github/workflows/*` and workflow triggers only work within
 # their own repo, so this and the Dockerfiles live in that fork. This branch
-# (`kubetee/mimo-penfix`) carries the CURRENT build surface:
+# (`kubetee/mimo-penfix-r2`) carries the CURRENT build surface:
 #   .github/workflows/build-sglang-overlay.yaml   (this file)
 #   docker/kubetee-mimo-overlay/Dockerfile        (mimo overlay — keeps the base
 #                                                  source byte-stable and applies
@@ -16,10 +16,10 @@
 # RUN IT (mimo overlay "penfix1" — base source + unmerged patches #43518 + #41738):
 #   gh workflow run build-sglang-overlay.yaml \
 #       --repo KubeTEE-AI/sglang \
-#       --ref kubetee/mimo-penfix \
+#       --ref kubetee/mimo-penfix-r2 \
 #       -f variant=mimo \
-#       -f tag_prefix=mimo-cu13-20261025-penfix1
-#   (base_image + source_sha default to the nightly-dev-cu13-20261025-65633129
+#       -f tag_prefix=mimo-cu13-20261031-penfix1-r2
+#   (base_image + source_sha default to the nightly-dev-cu13-20261031-a2cafa56
 #    digest-pin + its build commit; override BOTH together on a base bump.)
 #
 # DESIGN NOTES:
@@ -72,7 +72,7 @@ on:
       base_image:
         description: "Base sglang nightly image (digest-pin for reproducibility)"
         required: false
-        default: "lmsysorg/sglang:nightly-dev-cu13-20261025-65633129@sha256:069efa1d6a2d58309529f53eeee34c39d69b1cdb455eaf7fb8de83e3fd0be727"
+        default: "lmsysorg/sglang:nightly-dev-cu13-20261031-a2cafa56@sha256:dc254d8c80e91d65ff332275dc68c59bafd664035b4b596b6969e25011159ca2"
       sglang_sha:
         description: "[dsv41] UNMODIFIED upstream sgl-project/sglang commit SHA to layer"
         required: false
@@ -80,7 +80,7 @@ on:
       source_sha:
         description: "[mimo] upstream SHA the base image was built from (patch target + provenance)"
         required: false
-        default: "656331295619a4d0267b40b7da0b5cd5b549fcbc"
+        default: "a2cafa56766cdd7a8c51f04008bdc0fbb1b64ebb"
       tag_prefix:
         description: "Exact primary tag override (empty = computed <key>-<shortsha>-<date>)"
         required: false
