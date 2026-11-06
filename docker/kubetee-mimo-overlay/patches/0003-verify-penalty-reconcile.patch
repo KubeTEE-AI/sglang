@@ -1,8 +1,8 @@
 diff --git a/python/sglang/srt/speculative/dflash_utils.py b/python/sglang/srt/speculative/dflash_utils.py
-index 09b5571a67..c92708837f 100644
+index fe846a7bb4..ab30b0f780 100644
 --- a/python/sglang/srt/speculative/dflash_utils.py
 +++ b/python/sglang/srt/speculative/dflash_utils.py
-@@ -21,6 +21,7 @@ from sglang.srt.layers.sampler import (
+@@ -22,6 +22,7 @@ from sglang.srt.layers.sampling_renorm import top_k_renorm_prob, top_p_renorm_pr
  from sglang.srt.managers.schedule_batch import Req
  from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
  from sglang.srt.runtime_context import get_spec
@@ -10,7 +10,7 @@ index 09b5571a67..c92708837f 100644
  from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
  from sglang.srt.utils import is_npu
  
-@@ -237,9 +238,17 @@ def apply_dflash_verify_logits_adjustments(
+@@ -251,9 +252,17 @@ def apply_dflash_verify_logits_adjustments(
              num_tokens_in_batch=draft_token_num,
          )
  
@@ -29,7 +29,7 @@ index 09b5571a67..c92708837f 100644
  
      logits_3d: Optional[torch.Tensor] = None
  
-@@ -249,42 +258,50 @@ def apply_dflash_verify_logits_adjustments(
+@@ -263,42 +272,50 @@ def apply_dflash_verify_logits_adjustments(
              logits_3d = next_token_logits.reshape(bs, draft_token_num, -1)
          return logits_3d
  
