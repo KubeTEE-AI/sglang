@@ -6,8 +6,10 @@ handler and transport paths execute; only the process factory and warmup/glue
 which require a loaded model are stubbed. Not evidence of model readiness.
 """
 
+import json
 import os
 import sys
+import tempfile
 import time
 from types import SimpleNamespace
 from unittest import mock
@@ -62,7 +64,36 @@ def main():
         raise ValueError("port and health port are required")
     port, health = map(int, sys.argv[1:])
     certs = os.environ["SGLANG_TEST_CERTS"]
+    model_dir = tempfile.mkdtemp(prefix="kimi-k31-transport-model-")
+    with open(os.path.join(model_dir, "config.json"), "w") as handle:
+        json.dump(
+            {
+                "architectures": ["LlamaForCausalLM"],
+                "model_type": "llama",
+                "hidden_size": 16,
+                "intermediate_size": 32,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "num_hidden_layers": 2,
+                "vocab_size": 128,
+                "max_position_embeddings": 2048,
+            },
+            handle,
+        )
     argv = [
+        "--model-path",
+        model_dir,
+        "--served-model-name",
+        "unit-stub",
+        "--skip-tokenizer-init",
+        "--device",
+        "cpu",
+        # Both are explicit integers: Day 0 validation occurs after parsing
+        # and requires chunked_prefill_size to be divisible by page_size.
+        "--chunked-prefill-size",
+        "16384",
+        "--page-size",
+        "64",
         "--host",
         "127.0.0.1",
         "--port",
@@ -81,36 +112,21 @@ def main():
     args = prepare_server_args(argv)
     from sglang.srt import runtime_context
 
-    # Transport-only startup: the full model resolver requires a checkpoint.
-    # Invoke the real HTTP setup after publishing the parsed CLI configuration,
-    # so no model-resolution checks or fixtures stand in for these listeners.
-    runtime_context.get_context().set_server_args(args)
-    args._input_frozen = True
+    # Normal Engine startup performs resolve_once() before validation. Keep
+    # that ordering: passing None as a substitute for defaults is invalid.
+    runtime_context.publish(args, role="tokenizer")
+    args.check_server_args()
     assert args.ssl_client_verify is True and args.health_only_port == health
     assert args.enable_http2 and args.tokenizer_worker_num == 1
 
-    fake_launch_subprocesses(server_args=args)
-    tokenizer_manager = http_server._global_state.tokenizer_manager
-    http_server.set_global_state(
-        http_server._GlobalState(
-            tokenizer_manager=tokenizer_manager,
-            template_manager=None,
-            scheduler_info={},
-        )
-    )
-    with mock.patch.object(
-        http_server, "set_uvicorn_logging_configs", lambda _: None
-    ), mock.patch.object(
-        http_server, "_wait_and_warmup", lambda **kwargs: None
+    with (
+        mock.patch.object(
+            http_server.Engine, "_launch_subprocesses", fake_launch_subprocesses
+        ),
+        mock.patch.object(http_server, "_wait_and_warmup", lambda **kwargs: None),
+        mock.patch.object(http_server, "set_uvicorn_logging_configs", lambda _: None),
     ):
-        http_server._setup_and_run_http_server(
-            server_args=args,
-            tokenizer_manager=tokenizer_manager,
-            template_manager=None,
-            port_args=None,
-            scheduler_infos=[{}],
-            subprocess_watchdog=None,
-        )
+        http_server.launch_server(args)
 
 
 if __name__ == "__main__":
