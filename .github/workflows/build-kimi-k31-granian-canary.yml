@@ -122,9 +122,12 @@ jobs:
         run: |
           set -euo pipefail
           docker pull --quiet --platform linux/amd64 "$BASE_IMAGE"
+          docker run --rm --platform linux/amd64 --entrypoint /bin/cat "$BASE_IMAGE" /sgl-workspace/sglang/.k31-source-commit
           RECORDED=$(docker run --rm --platform linux/amd64 --entrypoint /bin/cat "$BASE_IMAGE" /sgl-workspace/sglang/.k31-source-commit)
+          printf "Expected %s; recorded: <%q>; length=%s\n" "$BASE_COMMIT" "$RECORDED" "${#RECORDED}"
           if [ "$RECORDED" != "$BASE_COMMIT" ]; then
-            echo "Base source records a different commit than required."
+            echo "STOP: source provenance disagreement. Inspect parent metadata; do not force tag reuse or replace the pinned parent."
+            docker image inspect "$BASE_IMAGE" --format '{{json .Config.Labels}}'
             exit 1
           fi
           docker run --rm --platform linux/amd64 --entrypoint python3 "$BASE_IMAGE" /sgl-workspace/sglang/docker/k31-image/verify_image.py
