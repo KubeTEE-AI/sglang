@@ -49,6 +49,7 @@ def fake_launch_subprocesses(*, server_args, **kwargs):
     http_server.app.post("/generate-test")(generate)
     http_server.app.post("/stream-test")(stream)
     manager = Manager()
+    manager.server_args = server_args
     return (
         manager,
         SimpleNamespace(),
