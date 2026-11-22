@@ -2806,6 +2806,7 @@ def _run_granian_server(
     exactly like uvicorn's defaults.
     """
     import signal
+    from pathlib import Path
 
     from granian import Granian
     from granian.constants import HTTPModes, Interfaces, Loops
@@ -2828,10 +2829,12 @@ def _run_granian_server(
             max_concurrent_streams=http2_max_concurrent_streams,
         ),
         log_level=log_level,
-        ssl_cert=ssl_certfile,
-        ssl_key=ssl_keyfile,
+        # Granian's embedded Server calls .resolve() on non-None TLS paths.
+        # SGLang's CLI normally supplies str values, so adapt at this boundary.
+        ssl_cert=Path(ssl_certfile) if ssl_certfile else None,
+        ssl_key=Path(ssl_keyfile) if ssl_keyfile else None,
         ssl_key_password=ssl_keyfile_password,
-        ssl_ca=ssl_ca_certs,
+        ssl_ca=Path(ssl_ca_certs) if ssl_ca_certs else None,
         ssl_client_verify=ssl_verify,
         backlog=backlog,
         backpressure=backpressure,
