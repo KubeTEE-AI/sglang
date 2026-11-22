@@ -67,6 +67,8 @@ def main():
         "unit-stub",
         "--served-model-name",
         "unit-stub",
+        "--chunked-prefill-size",
+        "8192",
         "--skip-tokenizer-init",
         "--host",
         "127.0.0.1",
