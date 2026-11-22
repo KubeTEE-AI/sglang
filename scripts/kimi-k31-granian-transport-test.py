@@ -90,6 +90,8 @@ def main():
         "--page-size",
         "1",
         "--skip-tokenizer-init",
+        "--device",
+        "cpu",
         "--host",
         "127.0.0.1",
         "--port",
