@@ -71,6 +71,7 @@ jobs:
             ':!python/sglang/srt/entrypoints/health_check.py' \
             ':!.github/workflows/build-kimi-k31-granian-canary.yml' \
             ':!docker/k31-image/canary-test-requirements.txt' \
+            ':!docker/k31-image/check_canary_context.py' \
             ':!docker/kubetee-granian-canary.Dockerfile' \
             ':!scripts/kimi-k31-granian-transport-test.py' \
             ':!test/registered/unit/entrypoints/test_granian_mtls_health_only.py')
@@ -102,10 +103,21 @@ jobs:
           ref: ${{ needs.provenance.outputs.source_sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Set up Docker Buildx
+      - name: Reclaim unused GitHub-hosted runner space
+        # Ephemeral ubuntu-latest only: never run this cleanup on a cluster node.
+        # Preserve Docker and the verified parent image. The huge FlashInfer
+        # base must not be imported twice when its thin transport patch builds.
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: true
+          docker-images: false
+      - name: Set up Docker Buildx using the daemon-local base image
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         with:
-          driver: docker-container
+          # The docker driver prefers the exact locally pulled base and reuses
+          # its unpacked layers; a docker-container buildkit snapshot instead
+          # duplicates the huge parent, exhausting this hosted runner's disk.
+          driver: docker
       - name: Login to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
@@ -124,6 +136,10 @@ jobs:
             docker image inspect "$BASE_IMAGE" --format '{{json .Config.Labels}}'
             exit 1
           fi
+          docker buildx inspect | python3 -c 'import sys; d=dict(line.split(":",1) for line in sys.stdin if ":" in line); assert d.get("Driver","").strip() == "docker", d'
+          echo "docker_storage_driver=$(docker info --format '{{.Driver}}')"
+          df -h /
+          docker system df
           docker run --rm --platform linux/amd64 --entrypoint python3 "$BASE_IMAGE" /sgl-workspace/sglang/docker/k31-image/verify_image.py
           echo "Verified parent source: $BASE_IMAGE -> $RECORDED"
       - name: Prepare the exact transport patch
@@ -153,38 +169,11 @@ jobs:
           # Validate every static COPY source against this actual build context.
           # Keep source-tree and build-context paths explicit; never rely on an
           # image pull, parent directory, or tree outside the staged context.
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-          context = Path("context")
-          sources = []
-          for line in (context / "Dockerfile").read_text().splitlines():
-              if not line.startswith("COPY "):
-                  continue
-              fields = line.split()
-              assert len(fields) >= 3, line
-              assert not any(f.startswith("--") for f in fields[1:-1]), line
-              for source in fields[1:-1]:
-                  assert source and not Path(source).is_absolute(), source
-                  assert ".." not in Path(source).parts, source
-                  assert (context / source).exists(), (
-                      f"Missing staged Docker COPY source: {source}"
-                  )
-                  sources.append(source)
-          assert sources == [
-              "merged.patch",
-              "changed_py.txt",
-              "k31-image",
-              "scripts-transport-launcher.py",
-              "transport-test.py",
-          ], sources
-          assert (context / "k31-image" / "verify_image.py").is_file()
-          assert (context / "k31-image" / "canary-test-requirements.txt").is_file()
-          print("All Docker COPY sources and verification assets are staged.")
-          PY
+          python3 docker/k31-image/check_canary_context.py context
           echo "PATCH_SHA256=$(sha256sum context/merged.patch | cut -d' ' -f1)" >> "$GITHUB_ENV"
           echo "Source: ${SRC_SHA}; base: ${BASE_IMAGE}"
       - name: Build, transport-test and publish immutable image
+        id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: context
@@ -205,10 +194,42 @@ jobs:
           provenance: mode=max
       - name: Resolve the deployable amd64 manifest, not the attestation index
         id: resolve
+        env:
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
-          docker pull --platform linux/amd64 "${IMAGE}"
-          DIGEST=$(docker buildx imagetools inspect "${IMAGE}" --format '{{json .Manifest}}' | python3 -c 'import json,sys; m=json.load(sys.stdin); assert m.get("mediaType")=="application/vnd.oci.image.index.v1+json"; matches=[x["digest"] for x in m["manifests"] if x["platform"]["os"]=="linux" and x["platform"]["architecture"]=="amd64" and x.get("annotations",{}).get("vnd.docker.reference.type")!="attestation-manifest"]; assert len(matches)==1; print(matches[0])')
+          docker buildx imagetools inspect "${IMAGE}" --raw > /tmp/kimi-candidate.json
+          # A single-platform image manifest is itself the subject. With an
+          # index, select its linux/amd64 child excluding the attestation.
+          DIGEST=$(python3 - "${BUILD_DIGEST}" <<'PY'
+          import json, re, sys
+          m = json.load(open("/tmp/kimi-candidate.json"))
+          if m.get("mediaType") == "application/vnd.oci.image.index.v1+json":
+              matches = [x["digest"] for x in m["manifests"]
+                         if x.get("platform") == {"os": "linux", "architecture": "amd64"}
+                         and x.get("annotations", {}).get("vnd.docker.reference.type")
+                         != "attestation-manifest"]
+              assert len(matches) == 1, matches
+              print(matches[0])
+          else:
+              assert m.get("mediaType") in {
+                  "application/vnd.oci.image.manifest.v1+json",
+                  "application/vnd.docker.distribution.manifest.v2+json",
+              }, m.get("mediaType")
+              assert re.fullmatch(r"sha256:[0-9a-f]{64}", sys.argv[1]), sys.argv[1]
+              print(sys.argv[1])
+          PY
+          )
+          test -n "$DIGEST"
+          docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --format '{{json .Image}}' > /tmp/kimi-candidate-image.json
+          python3 - <<'PY'
+          import json, os
+          image = json.load(open("/tmp/kimi-candidate-image.json"))
+          labels = image.get("config", {}).get("Labels", {})
+          assert labels.get("org.opencontainers.image.revision") == os.environ["SRC_SHA"], labels
+          assert labels.get("ai.kubetee.base-image") == os.environ["BASE_IMAGE"], labels
+          print("Candidate labels verify the committed source and exact parent.")
+          PY
           test -n "$DIGEST"
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
           echo "CANDIDATE=${IMAGE}@${DIGEST}" >> "$GITHUB_ENV"
