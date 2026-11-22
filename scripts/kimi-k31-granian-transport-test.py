@@ -6,10 +6,8 @@ handler and transport paths execute; only the process factory and warmup/glue
 which require a loaded model are stubbed. Not evidence of model readiness.
 """
 
-import json
 import os
 import sys
-import tempfile
 import time
 from types import SimpleNamespace
 from unittest import mock
@@ -64,30 +62,7 @@ def main():
         raise ValueError("port and health port are required")
     port, health = map(int, sys.argv[1:])
     certs = os.environ["SGLANG_TEST_CERTS"]
-    model_dir = tempfile.mkdtemp(prefix="kimi-k31-transport-model-")
-    with open(os.path.join(model_dir, "config.json"), "w") as handle:
-        json.dump(
-            {
-                "architectures": ["LlamaForCausalLM"],
-                "model_type": "llama",
-                "hidden_size": 16,
-                "intermediate_size": 32,
-                "num_attention_heads": 2,
-                "num_key_value_heads": 2,
-                "num_hidden_layers": 2,
-                "vocab_size": 128,
-                "max_position_embeddings": 2048,
-            },
-            handle,
-        )
     argv = [
-        "--model-path",
-        model_dir,
-        "--served-model-name",
-        "unit-stub",
-        "--skip-tokenizer-init",
-        "--device",
-        "cpu",
         "--host",
         "127.0.0.1",
         "--port",
@@ -104,24 +79,38 @@ def main():
         str(health),
     ]
     args = prepare_server_args(argv)
-    args.check_server_args()
     from sglang.srt import runtime_context
 
-    runtime_context.publish(args, role="tokenizer")
+    # Transport-only startup: the full model resolver requires a checkpoint.
+    # Invoke the real HTTP setup after publishing the parsed CLI configuration,
+    # so no model-resolution checks or fixtures stand in for these listeners.
+    runtime_context.get_context().set_server_args(args)
+    args._input_frozen = True
     assert args.ssl_client_verify is True and args.health_only_port == health
     assert args.enable_http2 and args.tokenizer_worker_num == 1
 
-    # Do not stub server_args.resolve_once(), publish(), FastAPI lifespan,
-    # Granian, Uvicorn, TLS or health_generate. The first two parts perform the
-    # exact CLI/resolution conversion needed by real deployment arguments.
-    with (
-        mock.patch.object(
-            http_server.Engine, "_launch_subprocesses", fake_launch_subprocesses
-        ),
-        mock.patch.object(http_server, "_wait_and_warmup", lambda **kwargs: None),
-        mock.patch.object(http_server, "set_uvicorn_logging_configs", lambda _: None),
+    fake_launch_subprocesses(server_args=args)
+    tokenizer_manager = http_server._global_state.tokenizer_manager
+    http_server.set_global_state(
+        http_server._GlobalState(
+            tokenizer_manager=tokenizer_manager,
+            template_manager=None,
+            scheduler_info={},
+        )
+    )
+    with mock.patch.object(
+        http_server, "set_uvicorn_logging_configs", lambda _: None
+    ), mock.patch.object(
+        http_server, "_wait_and_warmup", lambda **kwargs: None
     ):
-        http_server.launch_server(args)
+        http_server._setup_and_run_http_server(
+            server_args=args,
+            tokenizer_manager=tokenizer_manager,
+            template_manager=None,
+            port_args=None,
+            scheduler_infos=[{}],
+            subprocess_watchdog=None,
+        )
 
 
 if __name__ == "__main__":
