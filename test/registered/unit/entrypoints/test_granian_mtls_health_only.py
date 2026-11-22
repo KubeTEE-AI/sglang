@@ -46,7 +46,8 @@ def openssl(*args):
 
 def identities(cert_dir):
     cert_dir = Path(cert_dir)
-    cert_dir.mkdir(parents=True, exist_ok=False)
+    cert_dir.mkdir(parents=True, exist_ok=True)
+    assert not any(cert_dir.iterdir()), f"CI identity directory not empty: {cert_dir}"
     for name in ("ca", "wrong-ca"):
         openssl(
             "req",
