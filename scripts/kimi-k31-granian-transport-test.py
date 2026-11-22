@@ -9,7 +9,6 @@ This is NOT a model-readiness test: that requires the real B300/Coco canary.
 
 import os
 import sys
-from types import SimpleNamespace
 from unittest import mock
 
 from fastapi import FastAPI
@@ -43,11 +42,13 @@ def main():
     # validator; this does not call any model-resolution validation.
     handle_ssl_validation(serving)
 
-    @app.post("/generate-test")
+    # Local test app, never the production global module app: no global route
+    # registration and no model-manager initialization is required.
+    app = FastAPI()
+
     async def generate():
         return ORJSONResponse({"text": "canary"})
 
-    @app.post("/stream-test")
     async def stream():
         async def events():
             for event in ("data: first\n\n", "data: second\n\n", "data: [DONE]\n\n"):
@@ -72,10 +73,9 @@ def main():
             self.last_receive_tstamp = time() - 1
             yield {"status": "unit health"}
 
-    # No fake FastAPI lifespan: the transport carries a deliberately minimal
-    # app, replacing model endpoints with this fixture's explicit test routes.
-    http_server.app = app
-    with mock.patch.object(http_server, "app", FastAPI()), mock.patch.object(
+    # Patch the launcher globals to this isolated ASGI transport fixture. The
+    # real `_run_granian_server` call is synchronous and exits with the server.
+    with mock.patch.object(http_server, "app", app), mock.patch.object(
         http_server, "health_generate", fake_health_generate
     ):
         http_server.app.post("/generate-test")(generate)
