@@ -6,6 +6,7 @@ minimal manager stub. CI generates single-use test identities in the runner and
 this entrypoint deletes their entire directory after the checks finish.
 """
 
+import http.client
 import multiprocessing as mp
 import os
 import shutil
@@ -18,7 +19,6 @@ from pathlib import Path
 import h2.config
 import h2.connection
 import h2.events
-import requests
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -32,7 +32,11 @@ def free_port():
 
 
 def openssl(*args):
-    subprocess.run(("openssl", *map(str, args)), check=True, capture_output=True)
+    try:
+        subprocess.run(("openssl", *map(str, args)), check=True, capture_output=True)
+    except subprocess.CalledProcessError as error:
+        print(error.stderr.decode(), end="", flush=True)
+        raise
 
 
 def identities(cert_dir):
@@ -89,27 +93,43 @@ def identities(cert_dir):
             "1",
             "-out",
             cert_dir / f"{name}.crt",
-            "-addext",
+            "-extfile",
+            cert_dir / f"{name}.extensions",
+            "-extensions",
+            "identity",
+        ]
+        extensions = [
             f"extendedKeyUsage={usage}",
-            "-addext",
             "subjectKeyIdentifier=hash",
-            "-addext",
             "authorityKeyIdentifier=keyid",
         ]
         if name == "server":
-            args += [
-                "-addext",
+            extensions += [
                 "basicConstraints=critical,CA:FALSE",
-                "-addext",
                 "subjectAltName=IP:127.0.0.1",
             ]
+        (cert_dir / f"{name}.extensions").write_text(
+            "[identity]\n" + "\n".join(extensions) + "\n"
+        )
         openssl(*args)
-    # KBS serves a traditional PKCS#1 RSA key; do not convert to PKCS#8.
+    # Exercise the same PKCS#1 serialization as KBS, even with OpenSSL 3/4
+    # where req/genrsa may emit PKCS#8 by default. The RSA key is unchanged.
+    openssl(
+        "rsa",
+        "-in",
+        cert_dir / "server.key",
+        "-traditional",
+        "-out",
+        cert_dir / "server-pkcs1.key",
+    )
+    (cert_dir / "server.key").unlink()
+    (cert_dir / "server-pkcs1.key").rename(cert_dir / "server.key")
     key_header = (cert_dir / "server.key").read_text().splitlines()[0]
     assert key_header == "-----BEGIN RSA PRIVATE KEY-----", key_header
 
 
-def http2_stream(port, context):
+def http2_exchange(port, context, method, path):
+    """Raw h2 client: avoids adding any transport-test-only HTTP package."""
     connection = h2.connection.H2Connection(
         config=h2.config.H2Configuration(client_side=True, header_encoding="utf-8")
     )
@@ -123,28 +143,46 @@ def http2_stream(port, context):
             connection.send_headers(
                 stream,
                 [
-                    (":method", "POST"),
+                    (":method", method),
                     (":scheme", "https"),
                     (":authority", "127.0.0.1"),
-                    (":path", "/stream-test"),
+                    (":path", path),
                     ("content-length", "0"),
                 ],
                 end_stream=True,
             )
-            data = b""
-            while not data.endswith(b"data: [DONE]\n\n"):
+            status, data, ended = None, b"", False
+            while not ended:
                 incoming = tls.recv(65535)
-                if not incoming:
-                    break
+                assert incoming, "stream closed before END_STREAM"
                 for event in connection.receive_data(incoming):
-                    if isinstance(event, h2.events.DataReceived):
+                    if isinstance(event, h2.events.ResponseReceived):
+                        headers = dict(event.headers)
+                        status = int(headers[":status"])
+                    elif isinstance(event, h2.events.DataReceived):
                         data += event.data
                         connection.acknowledge_received_data(
                             event.flow_controlled_length, event.stream_id
                         )
+                    elif isinstance(event, h2.events.StreamEnded):
+                        ended = True
                 tls.sendall(connection.data_to_send())
-            assert data == b"data: first\n\ndata: second\n\ndata: [DONE]\n\n", data
-            return b"data: first"
+            assert isinstance(status, int) and 100 <= status < 600, (status, data)
+            return status, data, tls.cipher()[0]
+
+
+def plaintext(port, method, path):
+    """Test the auxiliary HTTP/1.1 port without any extra test package."""
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    try:
+        # http.client quotes // as /%2F by design: preserve the raw path here.
+        connection.putrequest(method, path, skip_host=True)
+        connection.putheader("Host", f"127.0.0.1:{port}")
+        connection.endheaders()
+        response = connection.getresponse()
+        return response.status, response.read()
+    finally:
+        connection.close()
 
 
 def wait_port(port, process, seconds=60):
@@ -181,44 +219,47 @@ def main():
         proc.start()
         results = {}
         try:
+            # A real listener requires the server before any plaintext request.
             wait_port(https, proc)
             wait_port(health, proc)
             context = ssl.create_default_context(cafile=f"{cert_dir}/ca.pem")
             context.set_alpn_protocols(["h2"])
             context.load_cert_chain(f"{cert_dir}/client.crt", f"{cert_dir}/client.key")
-            results["SSE_H2"] = http2_stream(https, context).decode()
+            status, data, cipher = http2_exchange(https, context, "POST", "/stream-test")
+            assert status == 200, (status, data)
+            assert data == b"data: first\n\ndata: second\n\ndata: [DONE]\n\n", data
+            results["SSE_H2"] = "first;second;done"
+            results["MTLS_CIPHER"] = cipher
 
             # TLS verification stays enabled. CI's server has an explicit loopback SAN.
-            session = requests.Session()
-            session.cert = (f"{cert_dir}/client.crt", f"{cert_dir}/client.key")
-            session.verify = f"{cert_dir}/ca.pem"
-            response = session.post(
-                f"https://127.0.0.1:{https}/generate-test", timeout=10
-            )
-            assert response.status_code == 200 and response.json()["text"] == "canary"
-            results["INFERENCE_MTLS"] = response.status_code
+            status, data, _ = http2_exchange(https, context, "POST", "/generate-test")
+            assert status == 200 and b'"text":"canary"' in data, (status, data)
+            results["INFERENCE_MTLS"] = status
 
-            for path in ("/", "/v1/models", "/v1/attestation", "/v1/chat/completions"):
-                response = requests.get(f"http://127.0.0.1:{health}{path}", timeout=10)
-                assert response.status_code == 404, (path, response.status_code)
+            for path in (
+                "/",
+                "/v1/models",
+                "/v1/attestation",
+                "/v1/chat/completions",
+            ):
+                status, body = plaintext(health, "GET", path)
+                assert (status, body) == (404, b'{"detail":"Not Found"}'), (
+                    path,
+                    status,
+                    body,
+                )
             results["NO_INFERENCE_PLAINTEXT"] = 404
             for method, path, expected in (
-                ("get", "/health", 200),
-                ("get", "/health_generate", 200),
-                ("get", "//health_generate", 404),
-                ("head", "/health", 404),
-                ("post", "/health", 404),
-                ("post", "/generate", 404),
-                ("post", "/flush_cache", 404),
+                ("GET", "/health", 200),
+                ("GET", "/health_generate", 200),
+                ("GET", "//health_generate", 404),
+                ("HEAD", "/health", 404),
+                ("POST", "/health", 404),
+                ("POST", "/generate", 404),
+                ("POST", "/flush_cache", 404),
             ):
-                response = getattr(requests, method)(
-                    f"http://127.0.0.1:{health}{path}", timeout=25
-                )
-                assert response.status_code == expected, (
-                    method,
-                    path,
-                    response.status_code,
-                )
+                status, _ = plaintext(health, method, path)
+                assert status == expected, (method, path, status)
             results["HEALTH_ONLY_PATHS"] = "passed"
 
             for name, cert in (
@@ -228,15 +269,18 @@ def main():
                     (f"{cert_dir}/wrong.crt", f"{cert_dir}/wrong.key"),
                 ),
             ):
+                untrusted = ssl.create_default_context(cafile=f"{cert_dir}/ca.pem")
+                untrusted.set_alpn_protocols(["h2"])
+                if cert:
+                    untrusted.load_cert_chain(*cert)
                 try:
-                    requests.get(
-                        f"https://127.0.0.1:{https}/health_generate",
-                        verify=f"{cert_dir}/ca.pem",
-                        cert=cert,
-                        timeout=10,
+                    _, _, _ = http2_exchange(
+                        https, untrusted, "GET", "/health_generate"
                     )
                     raise AssertionError(f"Broken client certificate accepted: {name}")
-                except requests.exceptions.SSLError:
+                except ssl.SSLError:
+                    # Client-auth failure is rejected during the TLS handshake,
+                    # before any application HTTP response could be generated.
                     results[name] = "yes"
 
             # Auxiliary listener failure must stop the primary transport.
@@ -249,6 +293,9 @@ def main():
             results["CLEAN_SHUTDOWN"] = proc.exitcode
             proc = None
             print("TRANSPORT_PASSED", results, flush=True)
+        except BaseException:
+            print("TRANSPORT_FAILURE_RESULTS", results, flush=True)
+            raise
         finally:
             if proc is not None:
                 proc.terminate()
