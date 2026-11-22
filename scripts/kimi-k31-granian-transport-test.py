@@ -65,6 +65,8 @@ def main():
     argv = [
         "--model-path",
         "unit-stub",
+        "--served-model-name",
+        "unit-stub",
         "--skip-tokenizer-init",
         "--host",
         "127.0.0.1",
