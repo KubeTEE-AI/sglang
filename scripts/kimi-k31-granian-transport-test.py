@@ -90,7 +90,7 @@ def main():
             ssl_certfile=serving.ssl_certfile,
             ssl_keyfile=serving.ssl_keyfile,
             ssl_ca_certs=serving.ssl_ca_certs,
-            ssl_client_verify=True,
+            ssl_verify=serving.ssl_client_verify,
             health_only_port=serving.health_only_port,
         )
 
