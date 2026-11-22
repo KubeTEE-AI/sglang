@@ -12,7 +12,7 @@ ARG PATCH_SHA256
 WORKDIR /sgl-workspace/sglang
 COPY merged.patch /tmp/merged.patch
 COPY changed_py.txt /tmp/changed_py.txt
-COPY docker/k31-image /opt/k31-image
+COPY k31-image /opt/k31-image
 
 # Apply only the CI-expanded, allowlisted transport/test patch. The parent
 # must hold its recorded deployed source exactly. Source provenance is the

@@ -64,14 +64,7 @@ jobs:
             git fetch --no-tags --depth=1 origin "${BASE_COMMIT}"
           fi
           git merge-base --is-ancestor "$BASE_COMMIT" HEAD
-          # Stage untracked canary files so the CI patch remains complete.
-          git add .github/workflows/build-kimi-k31-granian-canary.yml \
-            docker/k31-image/canary-test-requirements.txt \
-            docker/kubetee-granian-canary.Dockerfile \
-            python/sglang/srt/entrypoints/health_check.py \
-            scripts/kimi-k31-granian-transport-test.py \
-            test/registered/unit/entrypoints/test_granian_mtls_health_only.py
-          CHANGED=$(git diff --cached --name-only "${BASE_COMMIT}" -- \
+          CHANGED=$(git diff --name-only "${BASE_COMMIT}" -- \
             ':!python/sglang/srt/arg_groups/fields/serving.py' \
             ':!python/sglang/srt/arg_groups/serving_hook.py' \
             ':!python/sglang/srt/entrypoints/http_server.py' \
@@ -140,13 +133,12 @@ jobs:
           test "${SRC_SHA}" = "$(git rev-parse HEAD)"
           git config --global --add safe.directory "${GITHUB_WORKSPACE}"
           mkdir context
-          git add python/sglang/srt/entrypoints/health_check.py
-          git diff --cached --binary "${BASE_COMMIT}" -- \
+          git diff --binary "${BASE_COMMIT}" -- \
             python/sglang/srt/arg_groups/fields/serving.py \
             python/sglang/srt/arg_groups/serving_hook.py \
             python/sglang/srt/entrypoints/http_server.py \
             python/sglang/srt/entrypoints/health_check.py > context/merged.patch
-          git diff --cached --name-only --diff-filter=AMR "${BASE_COMMIT}" -- \
+          git diff --name-only --diff-filter=AMR "${BASE_COMMIT}" -- \
             python/sglang/srt/arg_groups/fields/serving.py \
             python/sglang/srt/arg_groups/serving_hook.py \
             python/sglang/srt/entrypoints/http_server.py \
@@ -158,6 +150,38 @@ jobs:
           cp scripts/kimi-k31-granian-transport-test.py context/scripts-transport-launcher.py
           cp test/registered/unit/entrypoints/test_granian_mtls_health_only.py context/transport-test.py
           cp -r docker/k31-image context/k31-image
+          # Validate every static COPY source against this actual build context.
+          # Keep source-tree and build-context paths explicit; never rely on an
+          # image pull, parent directory, or tree outside the staged context.
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          context = Path("context")
+          sources = []
+          for line in (context / "Dockerfile").read_text().splitlines():
+              if not line.startswith("COPY "):
+                  continue
+              fields = line.split()
+              assert len(fields) >= 3, line
+              assert not any(f.startswith("--") for f in fields[1:-1]), line
+              for source in fields[1:-1]:
+                  assert source and not Path(source).is_absolute(), source
+                  assert ".." not in Path(source).parts, source
+                  assert (context / source).exists(), (
+                      f"Missing staged Docker COPY source: {source}"
+                  )
+                  sources.append(source)
+          assert sources == [
+              "merged.patch",
+              "changed_py.txt",
+              "k31-image",
+              "scripts-transport-launcher.py",
+              "transport-test.py",
+          ], sources
+          assert (context / "k31-image" / "verify_image.py").is_file()
+          assert (context / "k31-image" / "canary-test-requirements.txt").is_file()
+          print("All Docker COPY sources and verification assets are staged.")
+          PY
           echo "PATCH_SHA256=$(sha256sum context/merged.patch | cut -d' ' -f1)" >> "$GITHUB_ENV"
           echo "Source: ${SRC_SHA}; base: ${BASE_IMAGE}"
       - name: Build, transport-test and publish immutable image
