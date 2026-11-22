@@ -6,8 +6,10 @@ handler and transport paths execute; only the process factory and warmup/glue
 which require a loaded model are stubbed. Not evidence of model readiness.
 """
 
+import json
 import os
 import sys
+import tempfile
 import time
 from types import SimpleNamespace
 from unittest import mock
@@ -62,9 +64,25 @@ def main():
         raise ValueError("port and health port are required")
     port, health = map(int, sys.argv[1:])
     certs = os.environ["SGLANG_TEST_CERTS"]
+    model_dir = tempfile.mkdtemp(prefix="kimi-k31-transport-model-")
+    with open(os.path.join(model_dir, "config.json"), "w") as handle:
+        json.dump(
+            {
+                "architectures": ["LlamaForCausalLM"],
+                "model_type": "llama",
+                "hidden_size": 16,
+                "intermediate_size": 32,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "num_hidden_layers": 2,
+                "vocab_size": 128,
+                "max_position_embeddings": 2048,
+            },
+            handle,
+        )
     argv = [
         "--model-path",
-        "unit-stub",
+        model_dir,
         "--served-model-name",
         "unit-stub",
         "--chunked-prefill-size",
