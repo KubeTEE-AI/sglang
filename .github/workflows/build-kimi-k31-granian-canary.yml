@@ -16,6 +16,11 @@ on:
         required: false
         default: ""
         type: string
+      attest_source_sha:
+        description: "Exact source commit of the tested image; required with attest_only."
+        required: false
+        default: ""
+        type: string
 
 concurrency:
   group: kimi-k31-granian-canary
@@ -56,9 +61,9 @@ jobs:
           zizmor --persona=pedantic --no-online-audits .github/workflows/build-kimi-k31-granian-canary.yml
       - name: Resolve immutable source and allowlisted transport diff
         id: plan
-        shell: bash
         env:
           REQUESTED_REF: ${{ inputs.ref }}
+          ATTEST_SOURCE_SHA: ${{ inputs.attest_source_sha }}
         run: |
           set -euo pipefail
           if [ "$REQUESTED_REF" != "kubetee/kimi-k31-granian-mtls-day0" ] ||
@@ -69,8 +74,11 @@ jobs:
           if ! git cat-file -e "${BASE_COMMIT}^{commit}" 2>/dev/null; then
             git fetch --no-tags --depth=1 origin "${BASE_COMMIT}"
           fi
-          git merge-base --is-ancestor "$BASE_COMMIT" HEAD
-          CHANGED=$(git diff --name-only "${BASE_COMMIT}" -- \
+          SOURCE_SHA=$(git rev-parse HEAD)
+          [ -z "$ATTEST_SOURCE_SHA" ] || SOURCE_SHA="$ATTEST_SOURCE_SHA"
+          git cat-file -e "${SOURCE_SHA}^{commit}"
+          git merge-base --is-ancestor "$BASE_COMMIT" "$SOURCE_SHA"
+          CHANGED=$(git diff --name-only "${BASE_COMMIT}" "${SOURCE_SHA}" -- \
             ':!python/sglang/srt/arg_groups/fields/serving.py' \
             ':!python/sglang/srt/arg_groups/serving_hook.py' \
             ':!python/sglang/srt/entrypoints/http_server.py' \
@@ -85,7 +93,6 @@ jobs:
             printf '%s\n' "The transport canary cannot alter non-transport files:" "$CHANGED"
             exit 1
           fi
-          SOURCE_SHA=$(git rev-parse HEAD)
           echo "source_prefix=${SOURCE_SHA:0:8}" >> "$GITHUB_OUTPUT"
           echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/kubetee-ai/sglang:kimi-k31-granian-mtls-${GITHUB_RUN_ID}-${SOURCE_SHA:0:8}" >> "$GITHUB_OUTPUT"
@@ -223,6 +230,7 @@ jobs:
           assert tag.group(2) == os.environ["SOURCE_PREFIX"], "attest_only requires the exact successful-build commit"
           assert image["mediaType"] == "application/vnd.oci.image.manifest.v1+json", image["mediaType"]
           labels = json.load(open("/tmp/attest-config.json")).get("config", {}).get("Labels", {})
+          assert labels.get("ai.kubetee.canary.run-id") == tag.group(1), labels
           assert labels.get("ai.kubetee.base-image") == os.environ["BASE_IMAGE"], labels
           assert labels.get("org.opencontainers.image.revision") == os.environ["SRC_SHA"], labels
           print("Recovered the tested image labels; no rebuild needed.")
