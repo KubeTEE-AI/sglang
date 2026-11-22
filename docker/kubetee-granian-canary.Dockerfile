@@ -28,7 +28,10 @@ RUN set -eux; \
     command -v openssl; \
     python3 -c 'from importlib.metadata import version; print("granian=" + version("granian")); print("uvicorn=" + version("uvicorn"))'
 
-# Real SGLang CLI + model stub, real Granian/Uvicorn. No GPU, HF token, KBS,
+# Transport-only validation of the real Granian constructor and health-only
+# Uvicorn listener against a minimal ASGI fixture. No full application/model
+# lifespan is simulated; that needs the actual B300 guest. The parent remains
+# bit-for-bit identical except the allowlisted source patch. No cluster.
 # Trustee, cluster or production certificate access. Test-only h2 is installed
 # to a disposable PYTHONPATH; the parent's Python/Granian/FastAPI are untouched.
 COPY scripts-transport-launcher.py /sgl-workspace/scripts/kimi_k31_granian_transport_test.py

@@ -19,6 +19,7 @@ from pathlib import Path
 import h2.config
 import h2.connection
 import h2.events
+import h2.exceptions
 
 try:
     from sglang.test.ci.ci_register import register_cpu_ci
@@ -112,7 +113,7 @@ def identities(cert_dir):
         if name == "server":
             extensions += [
                 "basicConstraints=critical,CA:FALSE",
-                "subjectAltName=IP:127.0.0.1",
+                "subjectAltName=DNS:kimi-canary.test,IP:127.0.0.1",
             ]
         (cert_dir / f"{name}.extensions").write_text(
             "[identity]\n" + "\n".join(extensions) + "\n"
@@ -141,7 +142,7 @@ def http2_exchange(port, context, method, path):
     )
     with socket.create_connection(("127.0.0.1", port), timeout=10) as raw:
         raw.settimeout(10)
-        with context.wrap_socket(raw, server_hostname="127.0.0.1") as tls:
+        with context.wrap_socket(raw, server_hostname="kimi-canary.test") as tls:
             assert tls.selected_alpn_protocol() == "h2", "HTTP/2 not negotiated"
             connection.initiate_connection()
             tls.sendall(connection.data_to_send())
@@ -225,15 +226,26 @@ def main():
         proc.start()
         results = {}
         try:
-            # A real listener requires the server before any plaintext request.
-            wait_port(https, proc)
-            wait_port(health, proc)
             context = ssl.create_default_context(cafile=f"{cert_dir}/ca.pem")
             context.set_alpn_protocols(["h2"])
             context.load_cert_chain(f"{cert_dir}/client.crt", f"{cert_dir}/client.key")
-            status, data, cipher = http2_exchange(https, context, "POST", "/stream-test")
-            assert status == 200, (status, data)
-            assert data == b"data: first\n\ndata: second\n\ndata: [DONE]\n\n", data
+            # Readiness means an authenticated HTTP/2 application response,
+            # never merely a bound socket (ASGI lifespan may still be starting).
+            deadline = time.monotonic() + 45
+            while True:
+                if not proc.is_alive():
+                    raise RuntimeError(f"launcher exited {proc.exitcode} before readiness")
+                try:
+                    status, data, cipher = http2_exchange(https, context, "POST", "/stream-test")
+                    assert status == 200, (status, data)
+                    assert data == b"data: first\n\ndata: second\n\ndata: [DONE]\n\n", data
+                    break
+                except (OSError, ssl.SSLError, TimeoutError, ConnectionError, EOFError,
+                        h2.exceptions.ProtocolError):
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.25)
+            wait_port(health, proc)
             results["SSE_H2"] = "first;second;done"
             results["MTLS_CIPHER"] = cipher
 
