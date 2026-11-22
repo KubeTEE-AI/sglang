@@ -1,12 +1,12 @@
 name: Kimi K3.1 Granian mTLS canary
 
-# Build only on GitHub-hosted runners per KubeTEE image policy. The parent is
-# the production K3.1 digest; no CUDA/MoE/Rust extension is rebuilt here.
+# Build only on GitHub-hosted runners per KubeTEE policy. The parent has the
+# deployed K3.1 CUDA/MoE/Rust extensions; only its HTTP transport is patched.
 on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Canary branch or tag. Only this canary's guarded diff is permitted."
+        description: "Only the guarded canary branch is permitted."
         required: true
         default: kubetee/kimi-k31-granian-mtls-h2-canary
         type: string
@@ -43,7 +43,6 @@ jobs:
             'https://raw.githubusercontent.com/rhysd/actionlint/v1.7.11/scripts/download-actionlint.bash' \
             -o /tmp/kimi-actionlint.bash
           mkdir -p /tmp/kimi-actionlint-bin
-          # CI only: version-pinned upstream release script, never KubeTEE cluster tooling.
           bash /tmp/kimi-actionlint.bash 1.7.11 /tmp/kimi-actionlint-bin
           /tmp/kimi-actionlint-bin/actionlint -color
           python3 -m pip install 'zizmor==1.33.0'
@@ -55,23 +54,34 @@ jobs:
           REQUESTED_REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
-          if [ "$REQUESTED_REF" != "kubetee/kimi-k31-granian-mtls-h2-canary" ]; then
-            echo "Only the guarded canary branch may be used."
-            exit 1
-          fi
-          if [ -z "$REQUESTED_REF" ] || [ -n "${REQUESTED_REF%%${GITHUB_REF_NAME}}" ]; then
-            echo "Build ref must exactly match workflow's protected branch: $GITHUB_REF_NAME"
+          if [ "$REQUESTED_REF" != "kubetee/kimi-k31-granian-mtls-h2-canary" ] ||
+             [ "$GITHUB_REF_NAME" != "${REQUESTED_REF##*/}" ]; then
+            echo "Build ref must match the guarded canary branch."
             exit 1
           fi
           if ! git cat-file -e "${BASE_COMMIT}^{commit}" 2>/dev/null; then
-            # Shallow checkout is enough, but the pinned base needs explicit ancestry verification.
             git fetch --no-tags --depth=1 origin "${BASE_COMMIT}"
           fi
           git merge-base --is-ancestor "$BASE_COMMIT" HEAD
-          git add .github/workflows/build-kimi-k31-granian-canary.yml docker/k31-image/canary-test-requirements.txt docker/kubetee-granian-canary.Dockerfile python/sglang/srt/entrypoints/health_check.py scripts/kimi-k31-granian-transport-test.py test/registered/unit/entrypoints/test_granian_mtls_health_only.py
-          CHANGED=$(git diff --cached --name-only "${BASE_COMMIT}" -- ':!python/sglang/srt/arg_groups/fields/serving.py' ':!python/sglang/srt/arg_groups/serving_hook.py' ':!python/sglang/srt/entrypoints/http_server.py' ':!python/sglang/srt/entrypoints/health_check.py' ':!.github/workflows/build-kimi-k31-granian-canary.yml' ':!docker/k31-image/canary-test-requirements.txt' ':!docker/kubetee-granian-canary.Dockerfile' ':!scripts/kimi-k31-granian-transport-test.py' ':!test/registered/unit/entrypoints/test_granian_mtls_health_only.py')
+          # Stage untracked canary files so the CI patch remains complete.
+          git add .github/workflows/build-kimi-k31-granian-canary.yml \
+            docker/k31-image/canary-test-requirements.txt \
+            docker/kubetee-granian-canary.Dockerfile \
+            python/sglang/srt/entrypoints/health_check.py \
+            scripts/kimi-k31-granian-transport-test.py \
+            test/registered/unit/entrypoints/test_granian_mtls_health_only.py
+          CHANGED=$(git diff --cached --name-only "${BASE_COMMIT}" -- \
+            ':!python/sglang/srt/arg_groups/fields/serving.py' \
+            ':!python/sglang/srt/arg_groups/serving_hook.py' \
+            ':!python/sglang/srt/entrypoints/http_server.py' \
+            ':!python/sglang/srt/entrypoints/health_check.py' \
+            ':!.github/workflows/build-kimi-k31-granian-canary.yml' \
+            ':!docker/k31-image/canary-test-requirements.txt' \
+            ':!docker/kubetee-granian-canary.Dockerfile' \
+            ':!scripts/kimi-k31-granian-transport-test.py' \
+            ':!test/registered/unit/entrypoints/test_granian_mtls_health_only.py')
           if [ -n "$CHANGED" ]; then
-            printf '%s\n' "The transport canary cannot alter compiled/model/dependency files:" "$CHANGED"
+            printf '%s\n' "The transport canary cannot alter non-transport files:" "$CHANGED"
             exit 1
           fi
           SOURCE_SHA=$(git rev-parse HEAD)
@@ -80,23 +90,21 @@ jobs:
           echo "Transport-only immutable source: $SOURCE_SHA"
 
   build:
-    name: Build and verify K3.1 transport canary
+    name: Build, network-test and publish K3.1 transport canary
     needs: provenance
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write # Push the immutable GHCR candidate image.
-      id-token: write # OIDC for build-provenance signing.
-      attestations: write # Publish the source-to-image attestation.
+      packages: write # Push the immutable GHCR candidate.
+      id-token: write # OIDC for signed provenance.
+      attestations: write # Publish the candidate's attestation.
     env:
       SRC_SHA: ${{ needs.provenance.outputs.source_sha }}
       IMAGE: ${{ needs.provenance.outputs.image }}
     steps:
-      - name: Clean initial repository state
-        run: git clean -ffdx && git reset --hard
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Check out the exact resolved source commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          clean: true
           ref: ${{ needs.provenance.outputs.source_sha }}
           fetch-depth: 1
           persist-credentials: false
@@ -113,30 +121,32 @@ jobs:
       - name: Assert exact production base image identity
         run: |
           set -euo pipefail
-          docker pull --platform linux/amd64 "$BASE_IMAGE"
+          docker pull --quiet --platform linux/amd64 "$BASE_IMAGE"
           RECORDED=$(docker run --rm --platform linux/amd64 --entrypoint /bin/cat "$BASE_IMAGE" /sgl-workspace/sglang/.k31-source-commit)
           if [ "$RECORDED" != "$BASE_COMMIT" ]; then
-            echo "Image's .k31-source-commit ($RECORDED) is not the requested base ($BASE_COMMIT)."
+            echo "Base source records a different commit than required."
             exit 1
           fi
           docker run --rm --platform linux/amd64 --entrypoint python3 "$BASE_IMAGE" /sgl-workspace/sglang/docker/k31-image/verify_image.py
           echo "Verified parent source: $BASE_IMAGE -> $RECORDED"
       - name: Prepare the exact transport patch
         shell: bash
-        id: patch
         run: |
           set -euo pipefail
+          test "${SRC_SHA}" = "$(git rev-parse HEAD)"
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
           mkdir context
+          git add python/sglang/srt/entrypoints/health_check.py
           git diff --cached --binary "${BASE_COMMIT}" -- \
             python/sglang/srt/arg_groups/fields/serving.py \
             python/sglang/srt/arg_groups/serving_hook.py \
             python/sglang/srt/entrypoints/http_server.py \
             python/sglang/srt/entrypoints/health_check.py > context/merged.patch
           git diff --cached --name-only --diff-filter=AMR "${BASE_COMMIT}" -- \
-            'python/sglang/srt/arg_groups/fields/serving.py' \
-            'python/sglang/srt/arg_groups/serving_hook.py' \
-            'python/sglang/srt/entrypoints/http_server.py' \
-            'python/sglang/srt/entrypoints/health_check.py' > context/changed_py.txt
+            python/sglang/srt/arg_groups/fields/serving.py \
+            python/sglang/srt/arg_groups/serving_hook.py \
+            python/sglang/srt/entrypoints/http_server.py \
+            python/sglang/srt/entrypoints/health_check.py > context/changed_py.txt
           git worktree add --detach /tmp/kimi-canary-base "${BASE_COMMIT}"
           git -C /tmp/kimi-canary-base apply --check < "${PWD}/context/merged.patch"
           git worktree remove --force /tmp/kimi-canary-base
@@ -145,9 +155,7 @@ jobs:
           cp test/registered/unit/entrypoints/test_granian_mtls_health_only.py context/transport-test.py
           cp -r docker/k31-image context/k31-image
           echo "PATCH_SHA256=$(sha256sum context/merged.patch | cut -d' ' -f1)" >> "$GITHUB_ENV"
-          cp docker/k31-image/canary-test-requirements.txt context/k31-image/
-          echo "PATCH_SHA256=$(sha256sum context/merged.patch | cut -d' ' -f1)" >> "$GITHUB_ENV"
-          echo "Source: ${SRC_SHA}; base: ${BASE_IMAGE}; patch: ${PATCH_SHA256}"
+          echo "Source: ${SRC_SHA}; base: ${BASE_IMAGE}"
       - name: Build, transport-test and publish immutable image
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -167,36 +175,38 @@ jobs:
             ai.kubetee.canary.run-id=${{ github.run_id }}
             ai.kubetee.canary.transport=granian-mtls-health-only-uvicorn
           provenance: mode=max
-      - name: Assert immutable source, commit-linked run and digest
+      - name: Resolve the deployable amd64 manifest, not the attestation index
+        id: resolve
+        run: |
+          set -euo pipefail
+          docker pull --platform linux/amd64 "${IMAGE}"
+          DIGEST=$(docker buildx imagetools inspect "${IMAGE}" --format '{{json .Manifest}}' | python3 -c 'import json,sys; m=json.load(sys.stdin); assert m.get("mediaType")=="application/vnd.oci.image.index.v1+json"; matches=[x["digest"] for x in m["manifests"] if x["platform"]["os"]=="linux" and x["platform"]["architecture"]=="amd64" and x.get("annotations",{}).get("vnd.docker.reference.type")!="attestation-manifest"]; assert len(matches)==1; print(matches[0])')
+          test -n "$DIGEST"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "CANDIDATE=${IMAGE}@${DIGEST}" >> "$GITHUB_ENV"
+          echo "## K3.1 transport-only canary" >> "$GITHUB_STEP_SUMMARY"
+          echo "Source: \`${SRC_SHA}\`; base: \`${BASE_IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Immutable candidate: \`${IMAGE}@${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Not a deployment authorization; .39 only." >> "$GITHUB_STEP_SUMMARY"
+      - name: Attest image provenance
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.resolve.outputs.digest }}
+          push-to-registry: true
+      - name: Preserve commit, run, digest and attestation references
         id: publish
         run: |
           set -euo pipefail
-          DIGEST=$(docker buildx imagetools inspect "${IMAGE}" --format '{{json .Manifest}}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["digest"])')
+          DIGEST=${CANDIDATE##*@}
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
-          echo "CANDIDATE=${IMAGE}@${DIGEST}" >> "$GITHUB_ENV"
-          {
-            echo "## Kimi K3.1 transport-only canary"
-            echo '- **Source:** `'${SRC_SHA}'`'
-            echo '- **Base:** `'${BASE_IMAGE}'`'
-            echo '- **Immutable candidate:** `'${IMAGE}@${DIGEST}'`'
-            echo '- **GitHub Actions run:** '${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
-            echo '- **Transport build checks:** original K3.1 compiled-feature verifier + actual CLI Granian/Uvicorn transport harness.'
-            echo '- **Deployment:** not authorized by this build; .39 only.'
-          } >> "$GITHUB_STEP_SUMMARY"
-      - name: Attest image provenance
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
-        with:
-          subject-name: ${{ env.IMAGE }}
-          subject-digest: ${{ steps.publish.outputs.digest }}
-          push-to-registry: true
-      - name: Preserve source-to-run-to-digest provenance
-        run: |
-          test -n "${CANDIDATE:?The digest publication must set the candidate}"
-          printf 'source=%s\nbase=%s\nrun=%s\ncandidate=%s\n' \
+          printf 'source=%s\nbase=%s\nrun=%s\ncandidate=%s\nattestation-ref=%s\n' \
             "$SRC_SHA" "$BASE_IMAGE" \
             "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
-            "${CANDIDATE}" > provenance.txt
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+            "$CANDIDATE" \
+            "https://github.com/${GITHUB_REPOSITORY}/attestations" > provenance.txt
+      - name: Upload source-to-run-to-digest provenance
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: kimi-k31-granian-source-run-digest
           path: provenance.txt
