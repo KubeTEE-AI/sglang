@@ -69,6 +69,8 @@ def main():
         "unit-stub",
         "--chunked-prefill-size",
         "8192",
+        "--page-size",
+        "1",
         "--skip-tokenizer-init",
         "--host",
         "127.0.0.1",
