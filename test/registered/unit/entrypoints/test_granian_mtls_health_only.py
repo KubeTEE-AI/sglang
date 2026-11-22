@@ -6,7 +6,7 @@ minimal manager stub. CI generates single-use test identities in the runner and
 this entrypoint deletes their entire directory after the checks finish.
 """
 
-import multiprocessing
+import multiprocessing as mp
 import os
 import shutil
 import socket
@@ -183,7 +183,7 @@ def main():
         identities(cert_dir)
         https, health = free_port(), free_port()
         assert https != health
-        proc = multiprocessing.Process(target=serve, args=(https, health))
+        proc = mp.get_context("fork").Process(target=serve, args=(https, health))
         proc.start()
         results = {}
         try:

@@ -184,10 +184,12 @@ jobs:
           test -n "$DIGEST"
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
           echo "CANDIDATE=${IMAGE}@${DIGEST}" >> "$GITHUB_ENV"
-          echo "## K3.1 transport-only canary" >> "$GITHUB_STEP_SUMMARY"
-          echo "Source: \`${SRC_SHA}\`; base: \`${BASE_IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "Immutable candidate: \`${IMAGE}@${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "Not a deployment authorization; .39 only." >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## K3.1 transport-only canary"
+            echo "Source: \`${SRC_SHA}\`; base: \`${BASE_IMAGE}\`"
+            echo "Immutable candidate: \`${IMAGE}@${DIGEST}\`"
+            echo "Not a deployment authorization; .39 only."
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Attest image provenance
         uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
         with:
