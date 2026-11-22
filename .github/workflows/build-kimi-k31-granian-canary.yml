@@ -55,7 +55,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$REQUESTED_REF" != "kubetee/kimi-k31-granian-mtls-h2-canary" ] ||
-             [ "$GITHUB_REF_NAME" != "${REQUESTED_REF##*/}" ]; then
+             [ "$GITHUB_REF_NAME" != "$REQUESTED_REF" ]; then
             echo "Build ref must match the guarded canary branch."
             exit 1
           fi
