@@ -8,6 +8,7 @@ Confidential Containers guest policy can deny ExecProcessRequest by design.
 import asyncio
 import socket
 import threading
+import time
 
 import uvicorn
 from fastapi import Request
@@ -55,7 +56,7 @@ class UvicornHealthServer:
         self.stopping = False
         self.error = None
         self.shutdown = threading.Event()
-        self.started = threading.Event()
+        self.exited = threading.Event()
         self.thread = threading.Thread(
             target=self._run, name="sglang-health-only-uvicorn", daemon=True
         )
@@ -68,21 +69,30 @@ class UvicornHealthServer:
         except BaseException as error:
             self.error = error
         finally:
-            self.started.set()
-            if not self.stopping:
+            # Uvicorn sets server.started only after its successful startup;
+            # distinguish that from an ordinary, long-running serve() with an
+            # event marking thread exit, not an event named "started".
+            self.exited.set()
+            if self.stopping:
+                self.shutdown.set()
+            else:
                 self.on_failure()
-            self.shutdown.set()
 
     def start(self):
         self.thread.start()
         try:
-            if not self.started.wait(30):
-                raise RuntimeError(
-                    "Health-only Uvicorn did not start within 30 seconds"
-                )
+            # Let the actual server startup run without racing its own health
+            # event. Stop waiting as soon as its listener is ready or it exits.
+            deadline = time.monotonic() + 30
+            while not self.server.started and not self.exited.is_set():
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"Health-only Uvicorn did not start within 30 seconds: {self.error!r}"
+                    )
+                self.exited.wait(0.1)
             if not self.server.started:
                 raise RuntimeError(
-                    f"Health-only Uvicorn failed during startup: {self.error}"
+                    f"Health-only Uvicorn failed during startup: {self.error!r}"
                 )
             return self
         except BaseException:
