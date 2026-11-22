@@ -149,6 +149,14 @@ class Serving(msgspec.Struct):
         Optional[str],
         "The password to decrypt the SSL keyfile.",
     ] = None
+    ssl_client_verify: A[
+        bool,
+        "Require a valid client certificate from --ssl-ca-certs on the Granian HTTP/2 listener.",
+    ] = False
+    health_only_port: A[
+        Optional[int],
+        "Listen on --host with only plaintext GET /health and /health_generate. For Kubelet probes in a mTLS guest: never serves inference, admin or proxy routes. Requires --enable-http2, --ssl-client-verify and one tokenizer worker.",
+    ] = None
     enable_ssl_refresh: A[
         bool,
         "Enable automatic SSL certificate hot-reloading when cert/key files change on disk. Requires --ssl-certfile and --ssl-keyfile.",

@@ -2790,7 +2790,8 @@ def _run_granian_server(
     ssl_keyfile=None,
     ssl_ca_certs=None,
     ssl_keyfile_password=None,
-    ssl_verify=False,  # MTls is not supported
+    ssl_verify=False,
+    health_only_port=None,
     backlog=2048,
     backpressure=2048,
 ):
@@ -2841,27 +2842,47 @@ def _run_granian_server(
         granian_kwargs["loop"] = Loops.uvloop
 
     server = Server(**granian_kwargs)
+    health_server = None
+    try:
+        if health_only_port is not None:
+            if not ssl_verify:
+                raise ValueError(
+                    "--health-only-port requires client certificate verification."
+                )
+            from sglang.srt.entrypoints.health_check import UvicornHealthServer
 
-    if tokenizer_worker_num == 1:
-        if tokenizer_manager is not None:
-            # auto_create_handle_loop replaces the signal handler wired below,
-            # so shutdown can only reach this server through the hook.
-            tokenizer_manager.set_server_stop_hook(server.stop)
+            health_server = UvicornHealthServer(
+                host, health_only_port, on_failure=server.stop
+            ).start()
+            logger.info(
+                "Health-only Uvicorn listening on %s:%s; Granian :%s requires mTLS",
+                host,
+                health_only_port,
+                port,
+            )
+        if tokenizer_worker_num == 1:
+            if tokenizer_manager is not None:
+                # auto_create_handle_loop replaces the signal handler wired below,
+                # so shutdown can only reach this server through the hook.
+                tokenizer_manager.set_server_stop_hook(server.stop)
 
-        async def serve():
-            # The embedded server does not install its own signal handlers, so wire
-            # SIGINT/SIGTERM to a graceful stop, mirroring uvicorn's behavior.
-            loop = asyncio.get_running_loop()
-            for sig in (signal.SIGINT, signal.SIGTERM):
-                try:
-                    loop.add_signal_handler(sig, server.stop)
-                except (NotImplementedError, ValueError):
-                    pass
-            await server.serve()
+            async def serve():
+                # The embedded server does not install its own signal handlers, so wire
+                # SIGINT/SIGTERM to a graceful stop, mirroring uvicorn's behavior.
+                loop = asyncio.get_running_loop()
+                for sig in (signal.SIGINT, signal.SIGTERM):
+                    try:
+                        loop.add_signal_handler(sig, server.stop)
+                    except (NotImplementedError, ValueError):
+                        pass
+                await server.serve()
 
-        uvloop.run(serve())
-    else:
-        server.serve()
+            uvloop.run(serve())
+        else:
+            server.serve()
+    finally:
+        if health_server is not None:
+            health_server.stop()
 
 
 def _setup_and_run_http_server(
@@ -2967,7 +2988,8 @@ def _setup_and_run_http_server(
                     ssl_keyfile=get_serving().ssl_keyfile,
                     ssl_ca_certs=get_serving().ssl_ca_certs,
                     ssl_keyfile_password=get_serving().ssl_keyfile_password,
-                    ssl_verify=False,  # No MTLS supported for now.
+                    ssl_verify=get_serving().ssl_client_verify,
+                    health_only_port=get_serving().health_only_port,
                     tokenizer_manager=tokenizer_manager,
                 )
             elif get_serving().enable_ssl_refresh:
