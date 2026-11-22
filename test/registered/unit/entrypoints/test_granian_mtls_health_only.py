@@ -20,9 +20,14 @@ import h2.config
 import h2.connection
 import h2.events
 
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(est_time=60, suite="base-a-test-cpu")
+try:
+    from sglang.test.ci.ci_register import register_cpu_ci
+except ModuleNotFoundError:
+    # Distribution images ship sglang but intentionally omit its source-tree
+    # only test.ci package. Registration does not control any assertion below.
+    pass
+else:
+    register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
 
 def free_port():
