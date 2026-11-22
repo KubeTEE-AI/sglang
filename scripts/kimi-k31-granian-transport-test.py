@@ -89,6 +89,9 @@ def main():
     ]
     args = prepare_server_args(argv)
     args.check_server_args()
+    from sglang.srt import runtime_context
+
+    runtime_context.publish(args, role="tokenizer")
     assert args.ssl_client_verify is True and args.health_only_port == health
     assert args.enable_http2 and args.tokenizer_worker_num == 1
 
