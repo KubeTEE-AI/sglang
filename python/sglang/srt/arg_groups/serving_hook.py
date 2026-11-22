@@ -80,6 +80,32 @@ def handle_ssl_validation(server_args: Any):
             f"SSL CA certificates file not found: '{cfg.ssl_ca_certs}'. "
             f"Please check the --ssl-ca-certs path."
         )
+    if cfg.ssl_client_verify and not cfg.enable_http2:
+        raise ValueError(
+            "--ssl-client-verify requires --enable-http2: only Granian "
+            "enforces client certificate verification."
+        )
+    if cfg.ssl_client_verify and not (
+        cfg.ssl_certfile and cfg.ssl_keyfile and cfg.ssl_ca_certs
+    ):
+        raise ValueError(
+            "--ssl-client-verify requires --ssl-certfile, --ssl-keyfile, "
+            "and --ssl-ca-certs to be specified."
+        )
+    if cfg.health_only_port is not None:
+        if (
+            not cfg.enable_http2
+            or not cfg.ssl_client_verify
+            or cfg.tokenizer_worker_num != 1
+        ):
+            raise ValueError(
+                "--health-only-port requires --enable-http2, --ssl-client-verify "
+                "and one tokenizer worker."
+            )
+        if cfg.health_only_port < 1 or cfg.health_only_port > 65535:
+            raise ValueError("--health-only-port must be between 1 and 65535.")
+        if cfg.health_only_port == cfg.port:
+            raise ValueError("--health-only-port must differ from --port.")
     if cfg.enable_ssl_refresh and not (cfg.ssl_certfile and cfg.ssl_keyfile):
         raise ValueError(
             "--enable-ssl-refresh requires --ssl-certfile and --ssl-keyfile "
