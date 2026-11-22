@@ -29,20 +29,20 @@ RUN set -eux; \
     python3 -c 'from importlib.metadata import version; print("granian=" + version("granian")); print("uvicorn=" + version("uvicorn"))'
 
 # Real SGLang CLI + model stub, real Granian/Uvicorn. No GPU, HF token, KBS,
-# Trustee, cluster or production certificate access. The test program imports
-# only stdlib, h2, requests, and the classes sglang already bundles.
+# Trustee, cluster or production certificate access. Test-only h2 is installed
+# to a disposable PYTHONPATH; the parent's Python/Granian/FastAPI are untouched.
 COPY scripts-transport-launcher.py /sgl-workspace/scripts/kimi_k31_granian_transport_test.py
 COPY transport-test.py /tmp/transport-test.py
 RUN set -eux; \
-    mkdir -p /sgl-workspace/scripts; \
+    mkdir -p /sgl-workspace/scripts /tmp/kimi-k31-canary-test-packages; \
     touch /sgl-workspace/scripts/__init__.py; \
-    python3 -m venv --system-site-packages /tmp/kimi-k31-canary-venv; \
-    /tmp/kimi-k31-canary-venv/bin/pip install --no-cache-dir --require-hashes -r /opt/k31-image/canary-test-requirements.txt; \
+    python3 -c 'from importlib.util import find_spec; assert find_spec("granian") and find_spec("uvicorn") and find_spec("fastapi"), "Parent runtime packages must be visible"'; \
+    python3 -m pip install --no-cache-dir --require-hashes --target /tmp/kimi-k31-canary-test-packages -r /opt/k31-image/canary-test-requirements.txt; \
     export SGLANG_TEST_CERTS="$(mktemp -d)"; \
-    export PYTHONPATH=/sgl-workspace; \
+    export PYTHONPATH=/tmp/kimi-k31-canary-test-packages:/sgl-workspace; \
     test -n "${SGLANG_TEST_CERTS}"; \
-    /tmp/kimi-k31-canary-venv/bin/python /tmp/transport-test.py; \
+    python3 /tmp/transport-test.py; \
     test ! -d "${SGLANG_TEST_CERTS}"; \
-    unset SGLANG_TEST_CERTS; \
-    rm -rf /tmp/kimi-k31-canary-venv /tmp/transport-test.py /sgl-workspace/scripts; \
+    unset SGLANG_TEST_CERTS PYTHONPATH; \
+    rm -rf /tmp/kimi-k31-canary-test-packages /tmp/transport-test.py /sgl-workspace/scripts; \
     python3 /opt/k31-image/verify_image.py
