@@ -93,9 +93,11 @@ jobs:
             printf '%s\n' "The transport canary cannot alter non-transport files:" "$CHANGED"
             exit 1
           fi
-          echo "source_prefix=${SOURCE_SHA:0:8}" >> "$GITHUB_OUTPUT"
-          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
-          echo "image=ghcr.io/kubetee-ai/sglang:kimi-k31-granian-mtls-${GITHUB_RUN_ID}-${SOURCE_SHA:0:8}" >> "$GITHUB_OUTPUT"
+          {
+            echo "source_prefix=${SOURCE_SHA:0:8}"
+            echo "source_sha=$SOURCE_SHA"
+            echo "image=ghcr.io/kubetee-ai/sglang:kimi-k31-granian-mtls-${GITHUB_RUN_ID}-${SOURCE_SHA:0:8}"
+          } >> "$GITHUB_OUTPUT"
           echo "Transport-only immutable source: $SOURCE_SHA"
 
   build:
