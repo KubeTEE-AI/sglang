@@ -1,63 +1,27 @@
 #!/usr/bin/env python3
-"""CI-only real SGLang TLS/health entrypoint with a non-GPU manager stub.
+"""Network test of SGLang's real mTLS/health transport, without a model.
 
-No real model is constructed. The real CLI, launcher, server, Uvicorn health
-handler and transport paths execute; only the process factory and warmup/glue
-which require a loaded model are stubbed. Not evidence of model readiness.
+The actual --enable-http2 serving validator and _run_granian_server function
+are under test. A minimal model-independent ASGI app supplies synthetic
+inference/SSE responses and retains the original /health_generate handler.
+This is NOT a model-readiness test: that requires the real B300/Coco canary.
 """
 
-import json
 import os
 import sys
-import tempfile
-import time
 from types import SimpleNamespace
 from unittest import mock
 
+from fastapi import FastAPI
 from fastapi.responses import ORJSONResponse, StreamingResponse
+from sglang.srt.arg_groups.fields.serving import Serving
+from sglang.srt.arg_groups.serving_hook import handle_ssl_validation
 from sglang.srt.entrypoints import http_server
 from sglang.srt.managers.tokenizer_manager import ServerStatus
-from sglang.srt.server_args import prepare_server_args
 
 
-def fake_launch_subprocesses(*, server_args, **kwargs):
-    class Manager:
-        is_generation = True
-        gracefully_exit = False
-        server_status = ServerStatus.Up
-        last_receive_tstamp = 0
-        rid_to_state = {}
-        request_finished = None  # populated by the real lifespan cleanup code
-
-        def set_server_stop_hook(self, hook):
-            self.hook = hook
-
-        async def generate_request(self, request, raw_request):
-            self.last_receive_tstamp = time.time() - 1
-            yield {"status": "unit health"}
-
-    async def generate(_):
-        return ORJSONResponse({"text": "canary"})
-
-    async def stream(_):
-        async def events():
-            for event in ("data: first\n\n", "data: second\n\n", "data: [DONE]\n\n"):
-                yield event
-
-        return StreamingResponse(events(), media_type="text/event-stream")
-
-    http_server.app.post("/generate-test")(generate)
-    http_server.app.post("/stream-test")(stream)
-    manager = Manager()
-    manager.server_args = server_args
-    return (
-        manager,
-        SimpleNamespace(),
-        SimpleNamespace(),
-        SimpleNamespace(scheduler_infos=[{}]),
-        None,
-        [],
-    )
+async def fake_health_generate(_request):
+    return ORJSONResponse({"status": "unit health"})
 
 
 def main():
@@ -65,69 +29,70 @@ def main():
         raise ValueError("port and health port are required")
     port, health = map(int, sys.argv[1:])
     certs = os.environ["SGLANG_TEST_CERTS"]
-    model_dir = tempfile.mkdtemp(prefix="kimi-k31-transport-model-")
-    with open(os.path.join(model_dir, "config.json"), "w") as handle:
-        json.dump(
-            {
-                "architectures": ["LlamaForCausalLM"],
-                "model_type": "llama",
-                "hidden_size": 16,
-                "intermediate_size": 32,
-                "num_attention_heads": 2,
-                "num_key_value_heads": 2,
-                "num_hidden_layers": 2,
-                "vocab_size": 128,
-                "max_position_embeddings": 2048,
-            },
-            handle,
-        )
-    argv = [
-        "--model-path",
-        model_dir,
-        "--served-model-name",
-        "unit-stub",
-        "--skip-tokenizer-init",
-        "--device",
-        "cpu",
-        # Both are explicit integers: Day 0 validation occurs after parsing
-        # and requires chunked_prefill_size to be divisible by page_size.
-        "--chunked-prefill-size",
-        "16384",
-        "--page-size",
-        "64",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        str(port),
-        "--enable-http2",
-        "--ssl-client-verify",
-        "--ssl-certfile",
-        f"{certs}/server.crt",
-        "--ssl-keyfile",
-        f"{certs}/server.key",
-        "--ssl-ca-certs",
-        f"{certs}/ca.pem",
-        "--health-only-port",
-        str(health),
-    ]
-    args = prepare_server_args(argv)
-    from sglang.srt import runtime_context
+    serving = Serving(
+        host="127.0.0.1",
+        port=port,
+        enable_http2=True,
+        ssl_client_verify=True,
+        ssl_certfile=f"{certs}/server.crt",
+        ssl_keyfile=f"{certs}/server.key",
+        ssl_ca_certs=f"{certs}/ca.pem",
+        health_only_port=health,
+    )
+    # Test the exact transport-only constraints of the production SGLang
+    # validator; this does not call any model-resolution validation.
+    handle_ssl_validation(serving)
 
-    # Normal Engine startup performs resolve_once() before validation. Keep
-    # that ordering: passing None as a substitute for defaults is invalid.
-    runtime_context.publish(args, role="tokenizer")
-    args.check_server_args()
-    assert args.ssl_client_verify is True and args.health_only_port == health
-    assert args.enable_http2 and args.tokenizer_worker_num == 1
+    @app.post("/generate-test")
+    async def generate():
+        return ORJSONResponse({"text": "canary"})
 
-    with (
-        mock.patch.object(
-            http_server.Engine, "_launch_subprocesses", fake_launch_subprocesses
-        ),
-        mock.patch.object(http_server, "_wait_and_warmup", lambda **kwargs: None),
-        mock.patch.object(http_server, "set_uvicorn_logging_configs", lambda _: None),
+    @app.post("/stream-test")
+    async def stream():
+        async def events():
+            for event in ("data: first\n\n", "data: second\n\n", "data: [DONE]\n\n"):
+                yield event
+
+        return StreamingResponse(events(), media_type="text/event-stream")
+
+    class HealthManager:
+        is_generation = True
+        gracefully_exit = False
+        server_status = ServerStatus.Up
+        last_receive_tstamp = 0
+        rid_to_state = {}
+        request_finished = None
+
+        def set_server_stop_hook(self, hook):
+            self.hook = hook
+
+        async def generate_request(self, request, raw_request):
+            from time import time
+
+            self.last_receive_tstamp = time() - 1
+            yield {"status": "unit health"}
+
+    # No fake FastAPI lifespan: the transport carries a deliberately minimal
+    # app, replacing model endpoints with this fixture's explicit test routes.
+    http_server.app = app
+    with mock.patch.object(http_server, "app", FastAPI()), mock.patch.object(
+        http_server, "health_generate", fake_health_generate
     ):
-        http_server.launch_server(args)
+        http_server.app.post("/generate-test")(generate)
+        http_server.app.post("/stream-test")(stream)
+        http_server._run_granian_server(
+            host=serving.host,
+            port=serving.port,
+            log_level="info",
+            http2_max_concurrent_streams=serving.http2_max_concurrent_streams,
+            http2_initial_connection_window_size=serving.http2_initial_connection_window_size,
+            tokenizer_manager=HealthManager(),
+            ssl_certfile=serving.ssl_certfile,
+            ssl_keyfile=serving.ssl_keyfile,
+            ssl_ca_certs=serving.ssl_ca_certs,
+            ssl_client_verify=True,
+            health_only_port=serving.health_only_port,
+        )
 
 
 if __name__ == "__main__":
