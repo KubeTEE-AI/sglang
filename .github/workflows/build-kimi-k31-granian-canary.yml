@@ -44,7 +44,7 @@ jobs:
             -o /tmp/kimi-actionlint.bash
           mkdir -p /tmp/kimi-actionlint-bin
           bash /tmp/kimi-actionlint.bash 1.7.11 /tmp/kimi-actionlint-bin
-          /tmp/kimi-actionlint-bin/actionlint -color
+          /tmp/kimi-actionlint-bin/actionlint -color .github/workflows/build-kimi-k31-granian-canary.yml
           python3 -m pip install 'zizmor==1.33.0'
           zizmor --persona=pedantic --no-online-audits .github/workflows/build-kimi-k31-granian-canary.yml
       - name: Resolve immutable source and allowlisted transport diff
