@@ -14,7 +14,7 @@ from unittest import mock
 
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from sglang.srt.entrypoints import http_server
-from sglang.srt.managers.io_struct import ServerStatus
+from sglang.srt.managers.tokenizer_manager import ServerStatus
 from sglang.srt.server_args import prepare_server_args
 
 
@@ -25,6 +25,7 @@ def fake_launch_subprocesses(*, server_args, **kwargs):
         server_status = ServerStatus.Up
         last_receive_tstamp = 0
         rid_to_state = {}
+        request_finished = None  # populated by the real lifespan cleanup code
 
         def set_server_stop_hook(self, hook):
             self.hook = hook
