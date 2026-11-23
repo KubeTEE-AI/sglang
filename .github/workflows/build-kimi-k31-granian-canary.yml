@@ -16,6 +16,11 @@ on:
         required: false
         default: ""
         type: string
+      attest_run_id:
+        description: "Successful original build run referenced by the signed attestation."
+        required: false
+        default: ""
+        type: string
       attest_source_sha:
         description: "Exact source commit of the tested image; required with attest_only."
         required: false
@@ -114,7 +119,7 @@ jobs:
       IMAGE: ${{ needs.provenance.outputs.image }}
       SOURCE_PREFIX: ${{ needs.provenance.outputs.source_prefix }}
       POST_ATTEST_ONLY: ${{ inputs.attest_only }}
-      TESTED_RUN_ID: "${{ inputs.attest_run_id || github.run_id }}"
+      TESTED_RUN_ID: ${{ inputs.attest_run_id }}
     steps:
       - name: Check out the exact resolved source commit
         if: inputs.attest_only == ''
