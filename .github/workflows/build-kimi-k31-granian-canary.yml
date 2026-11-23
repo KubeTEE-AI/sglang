@@ -229,7 +229,7 @@ jobs:
           docker buildx imagetools inspect "${IMAGE}@${POST_ATTEST_ONLY}" --raw > /tmp/attest-manifest.json
           docker buildx imagetools inspect "${IMAGE}@${POST_ATTEST_ONLY}" --format '{{json .Image}}' > /tmp/attest-config.json
           python3 - <<'PY'
-          import hashlib, os, re
+          import hashlib, json, os, re
           raw = open("/tmp/attest-manifest.json", "rb").read()
           assert "sha256:" + hashlib.sha256(raw).hexdigest() == os.environ["POST_ATTEST_ONLY"]
           assert re.fullmatch(r"sha256:[0-9a-f]{64}", os.environ["POST_ATTEST_ONLY"])
