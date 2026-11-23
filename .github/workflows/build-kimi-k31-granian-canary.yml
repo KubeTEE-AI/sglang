@@ -250,6 +250,7 @@ jobs:
             echo "attestation-ref=https://github.com/${GITHUB_REPOSITORY}/attestations"
           } > provenance.txt
           echo "CANDIDATE=${IMAGE}@${POST_ATTEST_ONLY}" >> "$GITHUB_ENV"
+          echo "SUBJECT_DIGEST=${POST_ATTEST_ONLY}" >> "$GITHUB_ENV"
       - name: Resolve the deployable amd64 manifest, not the attestation index
         if: inputs.attest_only == ''
         id: resolve
@@ -292,6 +293,7 @@ jobs:
           test -n "$DIGEST"
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
           echo "CANDIDATE=${IMAGE}@${DIGEST}" >> "$GITHUB_ENV"
+          echo "SUBJECT_DIGEST=${DIGEST}" >> "$GITHUB_ENV"
           {
             echo "## K3.1 transport-only canary"
             echo "Source: \`${SRC_SHA}\`; base: \`${BASE_IMAGE}\`"
@@ -301,9 +303,12 @@ jobs:
       - name: Attest image provenance
         uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
         with:
-          # attestation subject input accepts tag@digest but not :tag alone.
+          # subject-name accepts tag@digest; subject-digest MUST be the bare
+          # `sha256:<hex>` or the action rejects it ("subject-digest must be in
+          # the format sha256:<hex-digest>"). SUBJECT_DIGEST is set to the bare
+          # digest by both resolve paths above (normal + attest_only).
           subject-name: ${{ env.CANDIDATE }}
-          subject-digest: ${{ env.CANDIDATE }}
+          subject-digest: ${{ env.SUBJECT_DIGEST }}
           push-to-registry: true
       - name: Preserve commit, run, digest and attestation references
         id: publish
