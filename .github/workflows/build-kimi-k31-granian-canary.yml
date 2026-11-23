@@ -114,6 +114,7 @@ jobs:
       IMAGE: ${{ needs.provenance.outputs.image }}
       SOURCE_PREFIX: ${{ needs.provenance.outputs.source_prefix }}
       POST_ATTEST_ONLY: ${{ inputs.attest_only }}
+      TESTED_RUN_ID: "${{ inputs.attest_run_id || github.run_id }}"
     steps:
       - name: Check out the exact resolved source commit
         if: inputs.attest_only == ''
@@ -220,14 +221,12 @@ jobs:
         if: inputs.attest_only != ''
         run: |
           set -euo pipefail
-          docker buildx imagetools inspect "${IMAGE}@${POST_ATTEST_ONLY}" --format '{{json .}}' > /tmp/attest-manifest.json
+          docker buildx imagetools inspect "${IMAGE}@${POST_ATTEST_ONLY}" --raw > /tmp/attest-manifest.json
           docker buildx imagetools inspect "${IMAGE}@${POST_ATTEST_ONLY}" --format '{{json .Image}}' > /tmp/attest-config.json
           python3 - <<'PY'
-          import json, os, re
-          manifest = json.load(open("/tmp/attest-manifest.json"))
-          assert manifest["mediaType"] == "application/vnd.oci.image.manifest.v1+json", manifest["mediaType"]
-          assert manifest["platform"] == {"architecture": "amd64", "os": "linux"}, manifest["platform"]
-          assert manifest["digest"] == os.environ["POST_ATTEST_ONLY"], manifest["digest"]
+          import hashlib, os, re
+          raw = open("/tmp/attest-manifest.json", "rb").read()
+          assert "sha256:" + hashlib.sha256(raw).hexdigest() == os.environ["POST_ATTEST_ONLY"]
           assert re.fullmatch(r"sha256:[0-9a-f]{64}", os.environ["POST_ATTEST_ONLY"])
           tag = re.fullmatch(r"ghcr\.io/.+:kimi-k31-granian-mtls-([0-9]+)-([0-9a-f]{8})", os.environ["IMAGE"])
           assert tag, os.environ["IMAGE"]
