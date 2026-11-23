@@ -522,7 +522,7 @@ from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 v1_loads_router.route_class = ORJSONRoute
 app.include_router(v1_loads_router)
 
-from sglang.srt.arg_groups.serving_hook import ssl_verify_of
+from sglang.srt.arg_groups.serving_hook import self_check_client_cert, ssl_verify_of
 from sglang.srt.entrypoints.elastic_ep import router as elastic_ep_router
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -2346,12 +2346,18 @@ async def _send_disaggregation_warmup_requests(
     headers: Dict[str, str],
     ssl_verify: Union[bool, str],
     timeout: int,
+    ssl_client_cert: Optional["tuple"] = None,
 ) -> List[int]:
     ssl_context = (
         ssl_verify
         if isinstance(ssl_verify, bool)
         else ssl.create_default_context(cafile=ssl_verify)
     )
+    if ssl_client_cert and not isinstance(ssl_context, bool):
+        # A client-verifying listener requires the probe's identity here too:
+        # without cert_auth the disagg warmup dies at the handshake like the
+        # /model_info wait above (strict chain + hostname verification stays).
+        ssl_context.load_cert_chain(*ssl_client_cert)
 
     async def send_request(session: aiohttp.ClientSession, dp_rank: int) -> int:
         json_data = {
@@ -2390,6 +2396,12 @@ def _execute_server_warmup(server_args: ServerArgs):
         headers["Authorization"] = f"Bearer {get_serving().api_key}"
 
     ssl_verify = ssl_verify_of(server_args)
+    # The self-check is a first-class mTLS client: with --ssl-client-verify the
+    # listener demands a client chain, so this loopback probe presents the
+    # serving pair as its identity (strict chain + hostname verification stays;
+    # the leaf's IP:127.0.0.1 SAN covers the loopback name). See
+    # self_check_client_cert.
+    ssl_client_cert = self_check_client_cert(server_args)
 
     # Wait until the server is launched
     success = False
@@ -2397,7 +2409,11 @@ def _execute_server_warmup(server_args: ServerArgs):
         time.sleep(1)
         try:
             res = requests.get(
-                url + "/model_info", timeout=5, headers=headers, verify=ssl_verify
+                url + "/model_info",
+                timeout=5,
+                headers=headers,
+                verify=ssl_verify,
+                cert=ssl_client_cert,
             )
             assert res.status_code == 200, f"{res=}, {res.text=}"
             success = True
@@ -2523,6 +2539,7 @@ def _execute_server_warmup(server_args: ServerArgs):
                 headers=headers,
                 timeout=warmup_timeout if warmup_timeout > 0 else 600,
                 verify=ssl_verify,
+                cert=ssl_client_cert,
             )
             assert res.status_code == 200, f"{res.text}"
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
@@ -2535,6 +2552,7 @@ def _execute_server_warmup(server_args: ServerArgs):
                     headers=headers,
                     ssl_verify=ssl_verify,
                     timeout=warmup_timeout if warmup_timeout > 0 else 1800,
+                    ssl_client_cert=ssl_client_cert,
                 )
             )
             failed_status_codes = [code for code in status_codes if code != 200]
@@ -2589,6 +2607,7 @@ def _freeze_gc_after_server_warmup(server_args: ServerArgs):
             headers=freeze_headers,
             timeout=10,
             verify=ssl_verify_of(server_args),
+            cert=self_check_client_cert(server_args),
         )
         res.raise_for_status()
     except requests.exceptions.RequestException:

@@ -995,3 +995,34 @@ def ssl_verify_of(cfg: Any):
             _ssl_verify_warned = True
         return False
     return True
+
+
+def self_check_client_cert(cfg: Any) -> "tuple | None":
+    """Client identity for the engine's loopback self-checks (startup warmup).
+
+    The Granian listener with --ssl-client-verify builds its WebPki client
+    verifier without an unauthenticated fallback, so EVERY client of the
+    serving port -- including this engine's own startup probes -- must present
+    a client-certificate chain, or the handshake fails with `certificate
+    required`. The serving pair IS that identity for the self-check: KubeTEE
+    east-west server leaves carry `extendedKeyUsage=serverAuth,clientAuth`, so
+    one pair both terminates TLS and authenticates the probe.
+
+    Verification is never relaxed here: the probe keeps full chain and hostname
+    verification (see ssl_verify_of), and the loopback probe passes hostname
+    verification because the leaf carries `IP:127.0.0.1`. Without an identity
+    the probes die at the handshake and the engine SIGQUITs with
+    `Initialization failed. warmup error` AFTER the weights have loaded.
+
+    Returns a requests/aiohttp-compatible (certfile, keyfile) pair, or None when
+    TLS is not configured. A client-verifying listener without its pair fails
+    closed here instead of silently probing without an identity.
+    """
+    if cfg.ssl_certfile and cfg.ssl_keyfile:
+        return (cfg.ssl_certfile, cfg.ssl_keyfile)
+    if cfg.ssl_client_verify:
+        raise ValueError(
+            "--ssl-client-verify requires --ssl-certfile and --ssl-keyfile so the "
+            "engine's startup self-check can present a client identity."
+        )
+    return None
