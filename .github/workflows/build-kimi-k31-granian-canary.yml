@@ -3,6 +3,10 @@ name: Kimi K3.1 Granian mTLS canary
 # Build only on GitHub-hosted runners per KubeTEE policy. The parent has the
 # deployed K3.1 CUDA/MoE/Rust extensions; only its HTTP transport is patched.
 # The recorded base lineage, not the Dockerfile path, constrains verification.
+# Attestation machinery removed 2026-11-23 (user direction): the signed
+# provenance step and its attest_only re-attest mode only produced format
+# errors after the build. The source-to-run-to-digest chain is preserved as
+# the provenance.txt artifact plus the label assertions below.
 on:
   workflow_dispatch:
     inputs:
@@ -10,21 +14,6 @@ on:
         description: "Only the guarded canary branch is permitted."
         required: true
         default: kubetee/kimi-k31-granian-mtls-day0
-        type: string
-      attest_only:
-        description: "Attest the tested immutable digest from a prior run; do not rebuild."
-        required: false
-        default: ""
-        type: string
-      attest_run_id:
-        description: "Successful original build run referenced by the signed attestation."
-        required: false
-        default: ""
-        type: string
-      attest_source_sha:
-        description: "Exact source commit of the tested image; required with attest_only."
-        required: false
-        default: ""
         type: string
 
 concurrency:
@@ -46,7 +35,6 @@ jobs:
     outputs:
       source_sha: ${{ steps.plan.outputs.source_sha }}
       image: ${{ steps.plan.outputs.image }}
-      source_prefix: ${{ steps.plan.outputs.source_prefix }}
     steps:
       - name: Check out the requested canary branch
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -68,7 +56,6 @@ jobs:
         id: plan
         env:
           REQUESTED_REF: ${{ inputs.ref }}
-          ATTEST_SOURCE_SHA: ${{ inputs.attest_source_sha }}
         run: |
           set -euo pipefail
           if [ "$REQUESTED_REF" != "kubetee/kimi-k31-granian-mtls-day0" ] ||
@@ -80,8 +67,6 @@ jobs:
             git fetch --no-tags --depth=1 origin "${BASE_COMMIT}"
           fi
           SOURCE_SHA=$(git rev-parse HEAD)
-          [ -z "$ATTEST_SOURCE_SHA" ] || SOURCE_SHA="$ATTEST_SOURCE_SHA"
-          git cat-file -e "${SOURCE_SHA}^{commit}"
           git merge-base --is-ancestor "$BASE_COMMIT" "$SOURCE_SHA"
           CHANGED=$(git diff --name-only "${BASE_COMMIT}" "${SOURCE_SHA}" -- \
             ':!python/sglang/srt/arg_groups/fields/serving.py' \
@@ -99,7 +84,6 @@ jobs:
             exit 1
           fi
           {
-            echo "source_prefix=${SOURCE_SHA:0:8}"
             echo "source_sha=$SOURCE_SHA"
             echo "image=ghcr.io/kubetee-ai/sglang:kimi-k31-granian-mtls-${GITHUB_RUN_ID}-${SOURCE_SHA:0:8}"
           } >> "$GITHUB_OUTPUT"
@@ -112,24 +96,17 @@ jobs:
     permissions:
       contents: read
       packages: write # Push the immutable GHCR candidate.
-      id-token: write # OIDC for signed provenance.
-      attestations: write # Publish the candidate's attestation.
     env:
       SRC_SHA: ${{ needs.provenance.outputs.source_sha }}
       IMAGE: ${{ needs.provenance.outputs.image }}
-      SOURCE_PREFIX: ${{ needs.provenance.outputs.source_prefix }}
-      POST_ATTEST_ONLY: ${{ inputs.attest_only }}
-      TESTED_RUN_ID: ${{ inputs.attest_run_id }}
     steps:
       - name: Check out the exact resolved source commit
-        if: inputs.attest_only == ''
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ needs.provenance.outputs.source_sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Reclaim unused GitHub-hosted runner space
-        if: inputs.attest_only == ''
         # Ephemeral ubuntu-latest only: never run this cleanup on a cluster node.
         # Preserve Docker and the verified parent image. The huge FlashInfer
         # base must not be imported twice when its thin transport patch builds.
@@ -138,7 +115,6 @@ jobs:
           tool-cache: true
           docker-images: false
       - name: Set up Docker Buildx using the daemon-local base image
-        if: inputs.attest_only == ''
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         with:
           # The docker driver prefers the exact locally pulled base and reuses
@@ -152,7 +128,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Assert exact production base image identity
-        if: inputs.attest_only == ''
         run: |
           set -euo pipefail
           docker pull --quiet --platform linux/amd64 "$BASE_IMAGE"
@@ -171,7 +146,6 @@ jobs:
           docker run --rm --platform linux/amd64 --entrypoint python3 "$BASE_IMAGE" /sgl-workspace/sglang/docker/k31-image/verify_image.py
           echo "Verified parent source: $BASE_IMAGE -> $RECORDED"
       - name: Prepare the exact transport patch
-        if: inputs.attest_only == ''
         shell: bash
         run: |
           set -euo pipefail
@@ -202,7 +176,6 @@ jobs:
           echo "PATCH_SHA256=$(sha256sum context/merged.patch | cut -d' ' -f1)" >> "$GITHUB_ENV"
           echo "Source: ${SRC_SHA}; base: ${BASE_IMAGE}"
       - name: Build, transport-test and publish immutable image
-        if: inputs.attest_only == ''
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -221,38 +194,8 @@ jobs:
             ai.kubetee.base-image=${{ env.BASE_IMAGE }}
             ai.kubetee.canary.run-id=${{ github.run_id }}
             ai.kubetee.canary.transport=granian-mtls-health-only-uvicorn
-          provenance: mode=max
-      - name: Resolve only the already-tested immutable image
-        if: inputs.attest_only != ''
-        run: |
-          set -euo pipefail
-          docker buildx imagetools inspect "${IMAGE}@${POST_ATTEST_ONLY}" --raw > /tmp/attest-manifest.json
-          docker buildx imagetools inspect "${IMAGE}@${POST_ATTEST_ONLY}" --format '{{json .Image}}' > /tmp/attest-config.json
-          python3 - <<'PY'
-          import hashlib, json, os, re
-          raw = open("/tmp/attest-manifest.json", "rb").read()
-          assert "sha256:" + hashlib.sha256(raw).hexdigest() == os.environ["POST_ATTEST_ONLY"]
-          assert re.fullmatch(r"sha256:[0-9a-f]{64}", os.environ["POST_ATTEST_ONLY"])
-          tag = re.fullmatch(r"ghcr\.io/.+:kimi-k31-granian-mtls-([0-9]+)-([0-9a-f]{8})", os.environ["IMAGE"])
-          assert tag, os.environ["IMAGE"]
-          assert tag.group(2) == os.environ["SOURCE_PREFIX"], "attest_only requires the exact successful-build commit"
-          labels = json.load(open("/tmp/attest-config.json")).get("config", {}).get("Labels", {})
-          assert labels.get("ai.kubetee.canary.run-id") == tag.group(1), labels
-          assert labels.get("ai.kubetee.base-image") == os.environ["BASE_IMAGE"], labels
-          assert labels.get("org.opencontainers.image.revision") == os.environ["SRC_SHA"], labels
-          print("Recovered the tested image labels; no rebuild needed.")
-          PY
-          {
-            echo "source=${SRC_SHA}"
-            echo "base=${BASE_IMAGE}"
-            echo "run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${TESTED_RUN_ID:-${GITHUB_RUN_ID}}"
-            echo "candidate=${IMAGE}@${POST_ATTEST_ONLY}"
-            echo "attestation-ref=https://github.com/${GITHUB_REPOSITORY}/attestations"
-          } > provenance.txt
-          echo "CANDIDATE=${IMAGE}@${POST_ATTEST_ONLY}" >> "$GITHUB_ENV"
-          echo "SUBJECT_DIGEST=${POST_ATTEST_ONLY}" >> "$GITHUB_ENV"
-      - name: Resolve the deployable amd64 manifest, not the attestation index
-        if: inputs.attest_only == ''
+          provenance: false
+      - name: Resolve the deployable amd64 manifest
         id: resolve
         env:
           BUILD_DIGEST: ${{ steps.build.outputs.digest }}
@@ -260,7 +203,7 @@ jobs:
           set -euo pipefail
           docker buildx imagetools inspect "${IMAGE}" --raw > /tmp/kimi-candidate.json
           # A single-platform image manifest is itself the subject. With an
-          # index, select its linux/amd64 child excluding the attestation.
+          # index, select its linux/amd64 child excluding any attestation.
           DIGEST=$(python3 - "${BUILD_DIGEST}" <<'PY'
           import json, re, sys
           m = json.load(open("/tmp/kimi-candidate.json"))
@@ -293,34 +236,22 @@ jobs:
           test -n "$DIGEST"
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
           echo "CANDIDATE=${IMAGE}@${DIGEST}" >> "$GITHUB_ENV"
-          echo "SUBJECT_DIGEST=${DIGEST}" >> "$GITHUB_ENV"
           {
             echo "## K3.1 transport-only canary"
             echo "Source: \`${SRC_SHA}\`; base: \`${BASE_IMAGE}\`"
             echo "Immutable candidate: \`${IMAGE}@${DIGEST}\`"
             echo "Not a deployment authorization; .39 only."
           } >> "$GITHUB_STEP_SUMMARY"
-      - name: Attest image provenance
-        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
-        with:
-          # subject-name accepts tag@digest; subject-digest MUST be the bare
-          # `sha256:<hex>` or the action rejects it ("subject-digest must be in
-          # the format sha256:<hex-digest>"). SUBJECT_DIGEST is set to the bare
-          # digest by both resolve paths above (normal + attest_only).
-          subject-name: ${{ env.CANDIDATE }}
-          subject-digest: ${{ env.SUBJECT_DIGEST }}
-          push-to-registry: true
-      - name: Preserve commit, run, digest and attestation references
+      - name: Preserve commit, run and digest references
         id: publish
         run: |
           set -euo pipefail
           DIGEST=${CANDIDATE##*@}
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
-          printf 'source=%s\nbase=%s\nrun=%s\ncandidate=%s\nattestation-ref=%s\n' \
+          printf 'source=%s\nbase=%s\nrun=%s\ncandidate=%s\n' \
             "$SRC_SHA" "$BASE_IMAGE" \
             "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
-            "$CANDIDATE" \
-            "https://github.com/${GITHUB_REPOSITORY}/attestations" > provenance.txt
+            "$CANDIDATE" > provenance.txt
       - name: Upload source-to-run-to-digest provenance
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
