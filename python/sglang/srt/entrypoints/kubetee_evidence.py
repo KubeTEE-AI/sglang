@@ -594,7 +594,14 @@ async def evidence_envelope(nonce: str | None = None) -> dict[str, Any]:
 
 if router is not None:
 
+    # Two mount paths for one handler. The gateway builds its fetch URL as
+    # ``api_base.rstrip('/') + '/kubetee/evidence'`` where ``api_base`` already
+    # ends in ``/v1``, so it requests ``/v1/kubetee/evidence``. A direct
+    # operator/client fetch (and the documented client guide) uses the root
+    # ``/kubetee/evidence``. Serving both lets the relay and the capture work
+    # with zero gateway changes. Role-scoped either way (404 on unknown role).
     @router.get("/kubetee/evidence")
+    @router.get("/v1/kubetee/evidence")
     async def get_evidence(role: str | None = None, nonce: str | None = None) -> Any:
         """Relay the guest's TDX evidence over the strict-mTLS listener.
 

@@ -212,6 +212,27 @@ def envelope_contract():
     print("envelope contract: fields, keyset commitment, signature, counter OK")
 
 
+def evidence_route_paths():
+    # The handler is registered under BOTH the root path and the /v1 alias
+    # because the gateway builds `api_base.rstrip('/') + '/kubetee/evidence'`
+    # where api_base ends in `/v1`. Both must decorate get_evidence or the
+    # relay 404s while a direct capture still works (a silent split-brain).
+    import ast
+    tree = ast.parse(Path(_MODULE_PATH).read_text())
+    found = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "get_evidence":
+            for dec in node.decorator_list:
+                if (isinstance(dec, ast.Call)
+                        and isinstance(dec.func, ast.Attribute)
+                        and dec.func.attr == "get" and dec.args
+                        and isinstance(dec.args[0], ast.Constant)):
+                    found.add(dec.args[0].value)
+    assert "/kubetee/evidence" in found, f"root path missing: {found}"
+    assert "/v1/kubetee/evidence" in found, f"/v1 alias missing: {found}"
+    print(f"evidence route paths: {sorted(found)} OK")
+
+
 def main():
     jcs_kats()
     statement_and_report_data_kats()
@@ -219,6 +240,7 @@ def main():
     ed25519_kats()
     x509_walk_vs_openssl()
     envelope_contract()
+    evidence_route_paths()
     print("KubeTEE evidence relay: all conformance checks passed")
 
 
