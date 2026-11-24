@@ -44,29 +44,23 @@ RUN set -euo pipefail; \
 #       self_check_client_cert, health_check.UvicornHealthServer, http_server
 #       Granian mTLS + inbound verify derivation). Model patches stay out.
 COPY overlay/docker/kubetee-mtls-overlay/patches/0001-native-granian-mtls.patch /tmp/kubetee-transport/
+COPY overlay/docker/kubetee-mtls-overlay/checksums/ /tmp/kubetee-transport/checksums/
+# NOTE: no shell heredocs in these RUN steps on purpose — a `<<EOF` body inside a
+# \`-continued RUN breaks the Dockerfile parser (the body lines become "unknown
+# instruction"). The checksum manifests live in checksums/*.sha instead.
 RUN set -euo pipefail; \
-    echo "0001 preimage: $(shasum -a 256 /sgl-workspace/sglang/python/sglang/srt/arg_groups/fields/serving.py  | cut -d' ' -f1)"; \
-    echo "0001 preimage: $(shasum -a 256 /sgl-workspace/sglang/python/sglang/srt/arg_groups/serving_hook.py  | cut -d' ' -f1)"; \
-    echo "0001 preimage: $(shasum -a 256 /sgl-workspace/sglang/python/sglang/srt/entrypoints/http_server.py | cut -d' ' -f1)"; \
-    shasum -a 256 -c <<'EOF'
-d076f80d479b362062f43f897e017bfd69f0341bd0268018e3eae581dcc473a8  /sgl-workspace/sglang/python/sglang/srt/arg_groups/fields/serving.py
-0e8dd220bb17bb109797aa1bd4228b4dc89725fc8f1bb8ad10d3bc1ed6eb96ba  /sgl-workspace/sglang/python/sglang/srt/arg_groups/serving_hook.py
-d5d7ae6c5e8f403f9a46617377ab96977d9d4f1f263c0b90fc9fd2769eef061e  /sgl-workspace/sglang/python/sglang/srt/entrypoints/http_server.py
-EOF
+    echo "0001 preimage: $(sha256sum /sgl-workspace/sglang/python/sglang/srt/arg_groups/fields/serving.py  | cut -d' ' -f1)"; \
+    echo "0001 preimage: $(sha256sum /sgl-workspace/sglang/python/sglang/srt/arg_groups/serving_hook.py  | cut -d' ' -f1)"; \
+    echo "0001 preimage: $(sha256sum /sgl-workspace/sglang/python/sglang/srt/entrypoints/http_server.py | cut -d' ' -f1)"; \
+    sha256sum -c /tmp/kubetee-transport/checksums/preimage-v0.5.23.sha; \
     echo 'transport/ (mTLS+health-only) on official v0.5.23 (297e54fd)' \
-      | tee /etc/kubetee-sglang-overlay-release
-    git -C /sgl-workspace/sglang init -q 2>/dev/null || true
-    git -C /sgl-workspace/sglang apply -v /tmp/kubetee-transport/0001-native-granian-mtls.patch
-    echo "0001 postimage: $(shasum -a 256 /sgl-workspace/sglang/python/sglang/srt/arg_groups/fields/serving.py  | cut -d' ' -f1)"; \
-    echo "0001 postimage: $(shasum -a 256 /sgl-workspace/sglang/python/sglang/srt/arg_groups/serving_hook.py  | cut -d' ' -f1)"; \
-    echo "0001 postimage: $(shasum -a 256 /sgl-workspace/sglang/python/sglang/srt/entrypoints/http_server.py | cut -d' ' -f1)"; \
-    echo "0001 postimage: $(shasum -a 256 /sgl-workspace/sglang/python/sglang/srt/entrypoints/health_check.py | cut -d' ' -f1)"; \
-    shasum -a 256 -c <<'EOF'
-df87b8ee3d6707b2596a95150bc5245023248fa5e4e679ae89c724836de145bd  /sgl-workspace/sglang/python/sglang/srt/arg_groups/fields/serving.py
-a1e631f286230492654e34f79b8c9b74cc05eb59e5e1ed914050e25509502847  /sgl-workspace/sglang/python/sglang/srt/arg_groups/serving_hook.py
-cc2b9cb7b3c8f28bc751e5288cd0fc3fb3d9595db3187620196b57964d9eefb6  /sgl-workspace/sglang/python/sglang/srt/entrypoints/http_server.py
-c11df3a8d8f02445a735905bfb3b2f19b722c901b0e816c5f83addc7ee2a028b  /sgl-workspace/sglang/python/sglang/srt/entrypoints/health_check.py
-EOF
+      | tee /etc/kubetee-sglang-overlay-release; \
+    git -C /sgl-workspace/sglang apply -v /tmp/kubetee-transport/0001-native-granian-mtls.patch; \
+    echo "0001 postimage: $(sha256sum /sgl-workspace/sglang/python/sglang/srt/arg_groups/fields/serving.py  | cut -d' ' -f1)"; \
+    echo "0001 postimage: $(sha256sum /sgl-workspace/sglang/python/sglang/srt/arg_groups/serving_hook.py  | cut -d' ' -f1)"; \
+    echo "0001 postimage: $(sha256sum /sgl-workspace/sglang/python/sglang/srt/entrypoints/http_server.py | cut -d' ' -f1)"; \
+    echo "0001 postimage: $(sha256sum /sgl-workspace/sglang/python/sglang/srt/entrypoints/health_check.py | cut -d' ' -f1)"; \
+    sha256sum -c /tmp/kubetee-transport/checksums/postimage-transport0001.sha; \
     echo "TRANSPORT PATCH 0001 APPLIED CLEAN (byte-verified postimage)"
 
 # --- build gate: transport tests must PASS --------------------------------------
