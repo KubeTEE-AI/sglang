@@ -1,0 +1,476 @@
+From f10db9db2c3c389636ef15419c49874bc4cb52e8 Mon Sep 17 00:00:00 2001
+From: KubeTEE <pierre@kubetee.ai>
+Date: Tue, 24 Nov 2026 08:17:01 +0200
+Subject: [PATCH] entrypoints: native Granian mTLS + health-only port
+ (transport 0001)
+
+Ports the KubeTEE east-west mTLS transport boundary (nim/SGLANG-MTLS-DEPLOYMENT.md)
+onto v0.5.23 as the transport/ layer: serving.py flags, serving_hook validation +
+self_check_client_cert, health_check.UvicornHealthServer (health-only plaintext
+listener), http_server Granian mTLS + inbound verify derivation. Model-layer
+patches (DFlash penalties, MiMo tool-loop) stay OUT of this layer; applied
+a-la-carte via docker/kubetee-mtls-overlay when a repro requires them.
+---
+ .../sglang/srt/arg_groups/fields/serving.py   |   8 ++
+ python/sglang/srt/arg_groups/serving_hook.py  |  57 +++++++++
+ python/sglang/srt/entrypoints/health_check.py | 108 ++++++++++++++++
+ python/sglang/srt/entrypoints/http_server.py  | 116 ++++++++++++++----
+ 4 files changed, 263 insertions(+), 26 deletions(-)
+ create mode 100644 python/sglang/srt/entrypoints/health_check.py
+
+diff --git a/python/sglang/srt/arg_groups/fields/serving.py b/python/sglang/srt/arg_groups/fields/serving.py
+index fda824b..628593a 100644
+--- a/python/sglang/srt/arg_groups/fields/serving.py
++++ b/python/sglang/srt/arg_groups/fields/serving.py
+@@ -149,6 +149,14 @@ class Serving(msgspec.Struct):
+         Optional[str],
+         "The password to decrypt the SSL keyfile.",
+     ] = None
++    ssl_client_verify: A[
++        bool,
++        "Require a valid client certificate from --ssl-ca-certs on the Granian HTTP/2 listener.",
++    ] = False
++    health_only_port: A[
++        Optional[int],
++        "Listen on --host with only plaintext GET /health and /health_generate. For Kubelet probes in a mTLS guest: never serves inference, admin or proxy routes. Requires --enable-http2, --ssl-client-verify and one tokenizer worker.",
++    ] = None
+     enable_ssl_refresh: A[
+         bool,
+         "Enable automatic SSL certificate hot-reloading when cert/key files change on disk. Requires --ssl-certfile and --ssl-keyfile.",
+diff --git a/python/sglang/srt/arg_groups/serving_hook.py b/python/sglang/srt/arg_groups/serving_hook.py
+index 95141eb..71e3fba 100644
+--- a/python/sglang/srt/arg_groups/serving_hook.py
++++ b/python/sglang/srt/arg_groups/serving_hook.py
+@@ -85,6 +85,32 @@ def handle_ssl_validation(server_args: Any):
+             "--enable-ssl-refresh requires --ssl-certfile and --ssl-keyfile "
+             "to be specified."
+         )
++    if cfg.ssl_client_verify and not cfg.enable_http2:
++        raise ValueError(
++            "--ssl-client-verify requires --enable-http2: only Granian "
++            "enforces client certificate verification."
++        )
++    if cfg.ssl_client_verify and not (
++        cfg.ssl_certfile and cfg.ssl_keyfile and cfg.ssl_ca_certs
++    ):
++        raise ValueError(
++            "--ssl-client-verify requires --ssl-certfile, --ssl-keyfile, "
++            "and --ssl-ca-certs to be specified."
++        )
++    if cfg.health_only_port is not None:
++        if (
++            not cfg.enable_http2
++            or not cfg.ssl_client_verify
++            or cfg.tokenizer_worker_num != 1
++        ):
++            raise ValueError(
++                "--health-only-port requires --enable-http2, --ssl-client-verify "
++                "and one tokenizer worker."
++            )
++        if cfg.health_only_port < 1 or cfg.health_only_port > 65535:
++            raise ValueError("--health-only-port must be between 1 and 65535.")
++        if cfg.health_only_port == cfg.port:
++            raise ValueError("--health-only-port must differ from --port.")
+     if cfg.enable_http_worker_reuseport and (
+         cfg.tokenizer_worker_num == 1 or cfg.enable_http2
+     ):
+@@ -969,3 +995,34 @@ def ssl_verify_of(cfg: Any):
+             _ssl_verify_warned = True
+         return False
+     return True
++
++
++def self_check_client_cert(cfg: Any) -> "tuple | None":
++    """Client identity for the engine's loopback self-checks (startup warmup).
++
++    The Granian listener with --ssl-client-verify builds its WebPki client
++    verifier without an unauthenticated fallback, so EVERY client of the
++    serving port -- including this engine's own startup probes -- must present
++    a client-certificate chain, or the handshake fails with `certificate
++    required`. The serving pair IS that identity for the self-check: KubeTEE
++    east-west server leaves carry `extendedKeyUsage=serverAuth,clientAuth`, so
++    one pair both terminates TLS and authenticates the probe.
++
++    Verification is never relaxed here: the probe keeps full chain and hostname
++    verification (see ssl_verify_of), and the loopback probe passes hostname
++    verification because the leaf carries `IP:127.0.0.1`. Without an identity
++    the probes die at the handshake and the engine SIGQUITs with
++    `Initialization failed. warmup error` AFTER the weights have loaded.
++
++    Returns a requests/aiohttp-compatible (certfile, keyfile) pair, or None when
++    TLS is not configured. A client-verifying listener without its pair fails
++    closed here instead of silently probing without an identity.
++    """
++    if cfg.ssl_certfile and cfg.ssl_keyfile:
++        return (cfg.ssl_certfile, cfg.ssl_keyfile)
++    if cfg.ssl_client_verify:
++        raise ValueError(
++            "--ssl-client-verify requires --ssl-certfile and --ssl-keyfile so the "
++            "engine's startup self-check can present a client identity."
++        )
++    return None
+diff --git a/python/sglang/srt/entrypoints/health_check.py b/python/sglang/srt/entrypoints/health_check.py
+new file mode 100644
+index 0000000..ccd14a5
+--- /dev/null
++++ b/python/sglang/srt/entrypoints/health_check.py
+@@ -0,0 +1,108 @@
++"""Restricted Uvicorn network listener for certificate-free Kubelet probes.
++
++This is not a mount of SGLang's FastAPI app: only the two existing health
++routes reach their original handler. Exec probes must not be substituted;
++Confidential Containers guest policy can deny ExecProcessRequest by design.
++"""
++
++import asyncio
++import socket
++import threading
++import time
++
++import uvicorn
++from fastapi import Request
++from fastapi.responses import ORJSONResponse
++
++
++async def health_only_app(scope, receive, send):
++    from sglang.srt.entrypoints.http_server import health_generate
++
++    if scope["type"] != "http":
++        return
++    if scope.get("method") == "GET" and scope.get("path") in (
++        "/health",
++        "/health_generate",
++    ):
++        response = await health_generate(Request(scope, receive=receive, send=send))
++    else:
++        response = ORJSONResponse({"detail": "Not Found"}, status_code=404)
++    await response(scope, receive, send)
++
++
++class UvicornHealthServer:
++    """Secondary server whose unexpected exit stops the primary mTLS server."""
++
++    def __init__(self, host, port, on_failure):
++        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
++        try:
++            self.socket.bind((host, port))
++            self.socket.listen(2048)
++        except BaseException:
++            self.socket.close()
++            raise
++        self.server = uvicorn.Server(
++            uvicorn.Config(
++                health_only_app,
++                host=host,
++                port=port,
++                log_level="warning",
++                access_log=False,
++                lifespan="off",
++            )
++        )
++        self.on_failure = on_failure
++        self.stopping = False
++        self.error = None
++        self.shutdown = threading.Event()
++        self.exited = threading.Event()
++        self.thread = threading.Thread(
++            target=self._run, name="sglang-health-only-uvicorn", daemon=True
++        )
++
++    def _run(self):
++        try:
++            # Do not let the auxiliary server steal Granian's signal handling.
++            self.server.install_signal_handlers = lambda: None
++            asyncio.run(self.server.serve(sockets=[self.socket]))
++        except BaseException as error:
++            self.error = error
++        finally:
++            # Uvicorn sets server.started only after its successful startup;
++            # distinguish that from an ordinary, long-running serve() with an
++            # event marking thread exit, not an event named "started".
++            self.exited.set()
++            if self.stopping:
++                self.shutdown.set()
++            else:
++                self.on_failure()
++
++    def start(self):
++        self.thread.start()
++        try:
++            # Let the actual server startup run without racing its own health
++            # event. Stop waiting as soon as its listener is ready or it exits.
++            deadline = time.monotonic() + 30
++            while not self.server.started and not self.exited.is_set():
++                if time.monotonic() >= deadline:
++                    raise RuntimeError(
++                        f"Health-only Uvicorn did not start within 30 seconds: {self.error!r}"
++                    )
++                self.exited.wait(0.1)
++            if not self.server.started:
++                raise RuntimeError(
++                    f"Health-only Uvicorn failed during startup: {self.error!r}"
++                )
++            return self
++        except BaseException:
++            self.stop()
++            raise
++
++    def stop(self):
++        if self.stopping:
++            return
++        self.stopping = True
++        self.server.should_exit = True
++        if not self.shutdown.wait(10):
++            raise RuntimeError("Health-only Uvicorn did not stop within 10 seconds")
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index 899a40f..95afb83 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -28,6 +28,7 @@ import tempfile
+ import threading
+ import time
+ import uuid
++from pathlib import Path
+ from contextlib import asynccontextmanager
+ from functools import partial
+ from http import HTTPStatus
+@@ -522,7 +523,7 @@ from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
+ v1_loads_router.route_class = ORJSONRoute
+ app.include_router(v1_loads_router)
+ 
+-from sglang.srt.arg_groups.serving_hook import ssl_verify_of
++from sglang.srt.arg_groups.serving_hook import self_check_client_cert, ssl_verify_of
+ from sglang.srt.entrypoints.elastic_ep import router as elastic_ep_router
+ from sglang.srt.runtime_context import (
+     get_disagg,
+@@ -2320,12 +2321,18 @@ async def _send_disaggregation_warmup_requests(
+     headers: Dict[str, str],
+     ssl_verify: Union[bool, str],
+     timeout: int,
++    ssl_client_cert: Optional["tuple"] = None,
+ ) -> List[int]:
+     ssl_context = (
+         ssl_verify
+         if isinstance(ssl_verify, bool)
+         else ssl.create_default_context(cafile=ssl_verify)
+     )
++    if ssl_client_cert and not isinstance(ssl_context, bool):
++        # A client-verifying listener requires the probe's identity here too:
++        # without cert_auth the disagg warmup dies at the handshake like the
++        # /model_info wait above (strict chain + hostname verification stays).
++        ssl_context.load_cert_chain(*ssl_client_cert)
+ 
+     async def send_request(session: aiohttp.ClientSession, dp_rank: int) -> int:
+         json_data = {
+@@ -2364,6 +2371,12 @@ def _execute_server_warmup(server_args: ServerArgs):
+         headers["Authorization"] = f"Bearer {get_serving().api_key}"
+ 
+     ssl_verify = ssl_verify_of(server_args)
++    # The self-check is a first-class mTLS client: with --ssl-client-verify the
++    # listener demands a client chain, so this loopback probe presents the
++    # serving pair as its identity (strict chain + hostname verification stays;
++    # the leaf's IP:127.0.0.1 SAN covers the loopback name). See
++    # self_check_client_cert.
++    ssl_client_cert = self_check_client_cert(server_args)
+ 
+     # Wait until the server is launched
+     success = False
+@@ -2371,7 +2384,11 @@ def _execute_server_warmup(server_args: ServerArgs):
+         time.sleep(1)
+         try:
+             res = requests.get(
+-                url + "/model_info", timeout=5, headers=headers, verify=ssl_verify
++                url + "/model_info",
++                timeout=5,
++                headers=headers,
++                verify=ssl_verify,
++                cert=ssl_client_cert,
+             )
+             assert res.status_code == 200, f"{res=}, {res.text=}"
+             success = True
+@@ -2496,6 +2513,7 @@ def _execute_server_warmup(server_args: ServerArgs):
+                 json=json_data,
+                 headers=headers,
+                 timeout=warmup_timeout if warmup_timeout > 0 else 600,
++                cert=ssl_client_cert,
+                 verify=ssl_verify,
+             )
+             assert res.status_code == 200, f"{res.text}"
+@@ -2509,6 +2527,7 @@ def _execute_server_warmup(server_args: ServerArgs):
+                     headers=headers,
+                     ssl_verify=ssl_verify,
+                     timeout=warmup_timeout if warmup_timeout > 0 else 1800,
++                    ssl_client_cert=ssl_client_cert,
+                 )
+             )
+             failed_status_codes = [code for code in status_codes if code != 200]
+@@ -2563,6 +2582,7 @@ def _freeze_gc_after_server_warmup(server_args: ServerArgs):
+             headers=freeze_headers,
+             timeout=10,
+             verify=ssl_verify_of(server_args),
++            cert=self_check_client_cert(server_args),
+         )
+         res.raise_for_status()
+     except requests.exceptions.RequestException:
+@@ -2752,6 +2772,22 @@ def _granian_http1_settings():
+     return HTTP1Settings(header_read_timeout=timeout_s * 1000)
+ 
+ 
++def _inbound_client_verify(cfg) -> bool:
++    """Whether the inbound listener must demand a client certificate (mTLS).
++
++    A CA bundle means the operator asked for mutual TLS: without
++    ``CERT_REQUIRED`` the context would still *load* that CA, so a client that
++    presents no certificate at all would still be accepted -- TLS, but not
++    mutual TLS, and no authentication. (KubeTEE 0005.)
++    """
++    return bool(getattr(cfg, "ssl_ca_certs", None))
++
++
++def _inbound_cert_reqs(cfg) -> int:
++    """``ssl.VerifyMode`` for uvicorn: REQUIRE when mTLS is configured."""
++    return ssl.CERT_REQUIRED if _inbound_client_verify(cfg) else ssl.CERT_NONE
++
++
+ def _run_granian_server(
+     host,
+     port,
+@@ -2764,7 +2800,8 @@ def _run_granian_server(
+     ssl_keyfile=None,
+     ssl_ca_certs=None,
+     ssl_keyfile_password=None,
+-    ssl_verify=False,  # MTls is not supported
++    ssl_verify=False,
++    health_only_port=None,
+     backlog=2048,
+     backpressure=2048,
+ ):
+@@ -2801,10 +2838,12 @@ def _run_granian_server(
+             max_concurrent_streams=http2_max_concurrent_streams,
+         ),
+         log_level=log_level,
+-        ssl_cert=ssl_certfile,
+-        ssl_key=ssl_keyfile,
++        # Granian's embedded Server calls .resolve() on non-None TLS paths.
++        # SGLang's CLI normally supplies str values, so adapt at this boundary.
++        ssl_cert=Path(ssl_certfile) if ssl_certfile else None,
++        ssl_key=Path(ssl_keyfile) if ssl_keyfile else None,
+         ssl_key_password=ssl_keyfile_password,
+-        ssl_ca=ssl_ca_certs,
++        ssl_ca=Path(ssl_ca_certs) if ssl_ca_certs else None,
+         ssl_client_verify=ssl_verify,
+         backlog=backlog,
+         backpressure=backpressure,
+@@ -2815,27 +2854,47 @@ def _run_granian_server(
+         granian_kwargs["loop"] = Loops.uvloop
+ 
+     server = Server(**granian_kwargs)
++    health_server = None
++    try:
++        if health_only_port is not None:
++            if not ssl_verify:
++                raise ValueError(
++                    "--health-only-port requires client certificate verification."
++                )
++            from sglang.srt.entrypoints.health_check import UvicornHealthServer
+ 
+-    if tokenizer_worker_num == 1:
+-        if tokenizer_manager is not None:
+-            # auto_create_handle_loop replaces the signal handler wired below,
+-            # so shutdown can only reach this server through the hook.
+-            tokenizer_manager.set_server_stop_hook(server.stop)
+-
+-        async def serve():
+-            # The embedded server does not install its own signal handlers, so wire
+-            # SIGINT/SIGTERM to a graceful stop, mirroring uvicorn's behavior.
+-            loop = asyncio.get_running_loop()
+-            for sig in (signal.SIGINT, signal.SIGTERM):
+-                try:
+-                    loop.add_signal_handler(sig, server.stop)
+-                except (NotImplementedError, ValueError):
+-                    pass
+-            await server.serve()
++            health_server = UvicornHealthServer(
++                host, health_only_port, on_failure=server.stop
++            ).start()
++            logger.info(
++                "Health-only Uvicorn listening on %s:%s; Granian :%s requires mTLS",
++                host,
++                health_only_port,
++                port,
++            )
++        if tokenizer_worker_num == 1:
++            if tokenizer_manager is not None:
++                # auto_create_handle_loop replaces the signal handler wired below,
++                # so shutdown can only reach this server through the hook.
++                tokenizer_manager.set_server_stop_hook(server.stop)
++
++            async def serve():
++                # The embedded server does not install its own signal handlers, so wire
++                # SIGINT/SIGTERM to a graceful stop, mirroring uvicorn's behavior.
++                loop = asyncio.get_running_loop()
++                for sig in (signal.SIGINT, signal.SIGTERM):
++                    try:
++                        loop.add_signal_handler(sig, server.stop)
++                    except (NotImplementedError, ValueError):
++                        pass
++                await server.serve()
+ 
+-        uvloop.run(serve())
+-    else:
+-        server.serve()
++            uvloop.run(serve())
++        else:
++            server.serve()
++    finally:
++        if health_server is not None:
++            health_server.stop()
+ 
+ 
+ def _setup_and_run_http_server(
+@@ -2941,7 +3000,8 @@ def _setup_and_run_http_server(
+                     ssl_keyfile=get_serving().ssl_keyfile,
+                     ssl_ca_certs=get_serving().ssl_ca_certs,
+                     ssl_keyfile_password=get_serving().ssl_keyfile_password,
+-                    ssl_verify=False,  # No MTLS supported for now.
++                    ssl_verify=get_serving().ssl_client_verify,
++                    health_only_port=get_serving().health_only_port,
+                     tokenizer_manager=tokenizer_manager,
+                 )
+             elif get_serving().enable_ssl_refresh:
+@@ -2959,6 +3019,7 @@ def _setup_and_run_http_server(
+                     ssl_certfile=get_serving().ssl_certfile,
+                     ssl_ca_certs=get_serving().ssl_ca_certs,
+                     ssl_keyfile_password=get_serving().ssl_keyfile_password,
++                    ssl_cert_reqs=_inbound_cert_reqs(get_serving()),
+                 )
+                 config.load()  # Creates the SSLContext
+ 
+@@ -3002,6 +3063,7 @@ def _setup_and_run_http_server(
+                         ssl_certfile=get_serving().ssl_certfile,
+                         ssl_ca_certs=get_serving().ssl_ca_certs,
+                         ssl_keyfile_password=get_serving().ssl_keyfile_password,
++                        ssl_cert_reqs=_inbound_cert_reqs(get_serving()),
+                     )
+                 )
+                 tokenizer_manager.set_server_stop_hook(
+@@ -3047,6 +3109,7 @@ def _setup_and_run_http_server(
+                     ssl_keyfile=get_serving().ssl_keyfile,
+                     ssl_ca_certs=get_serving().ssl_ca_certs,
+                     ssl_keyfile_password=get_serving().ssl_keyfile_password,
++                    ssl_verify=_inbound_client_verify(get_serving()),
+                 )
+             else:
+                 app_path = envs.SGLANG_HTTP_SERVER_APP_PATH.get()
+@@ -3064,6 +3127,7 @@ def _setup_and_run_http_server(
+                     "ssl_certfile": get_serving().ssl_certfile,
+                     "ssl_ca_certs": get_serving().ssl_ca_certs,
+                     "ssl_keyfile_password": get_serving().ssl_keyfile_password,
++                    "ssl_cert_reqs": _inbound_cert_reqs(get_serving()),
+                 }
+                 if get_serving().enable_http_worker_reuseport:
+                     config = uvicorn.Config(app_path, **uvicorn_options)
+-- 
+2.56.1
+
