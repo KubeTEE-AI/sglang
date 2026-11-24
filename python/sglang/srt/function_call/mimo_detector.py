@@ -21,13 +21,31 @@ from typing import Any, Dict, List
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
-from sglang.srt.function_call.core_types import StreamingParseResult, _GetInfoFunc
+from sglang.srt.function_call.core_types import (
+    StreamingParseResult,
+    ToolCallItem,
+    _GetInfoFunc,
+)
 from sglang.srt.function_call.utils import (
     get_schema_properties,
     safe_literal_eval,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _partial_token_suffix(text: str, token: str) -> str:
+    """Longest suffix of `text` that is a proper prefix of `token`.
+
+    A streaming chunk can split an opening tag (`"<tool_"` + `"call>"`), so the
+    tail must be held back until the next chunk either completes the tag or
+    disproves it. Holding anything more would delay text, and holding anything
+    less would leak a tag fragment to the client.
+    """
+    for keep in range(min(len(token) - 1, len(text)), 0, -1):
+        if text.endswith(token[:keep]):
+            return text[-keep:]
+    return ""
 
 
 def _get_param_type(func_name: str, param_name: str, tools: List[Tool]) -> str:
@@ -193,6 +211,11 @@ class MiMoDetector(BaseFormatDetector):
 
             last_end = match.end()
 
+        # Keep the prose between/after the tool calls (upstream #46566 item 4).
+        # Dropping it made an assistant turn look like "call only, no answer",
+        # which is what made agents re-issue the same call forever.
+        normal_text += text[last_end:]
+
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
     def parse_streaming_increment(
@@ -204,51 +227,79 @@ class MiMoDetector(BaseFormatDetector):
         self._buffer += new_text
         current_text = self._buffer
 
-        start = current_text.find(self.bot_token)
-        if start == -1:
-            if self.current_tool_id > 0:
-                # Already processing tool calls, keep buffering
-                # (more tool calls might come, don't discard text yet)
-                return StreamingParseResult(normal_text="")
-            else:
-                # No tool calls seen yet, return as normal text
-                self._buffer = ""
-                return StreamingParseResult(normal_text=current_text)
+        normal_text = ""
+        all_calls: List[ToolCallItem] = []
 
-        # Find end token AFTER the start token
-        end = current_text.find(self.eot_token, start)
-        if end == -1:
-            # Incomplete tool call, return text before start and keep buffering
-            normal_text = current_text[:start]
-            self._buffer = current_text[start:]
-            return StreamingParseResult(normal_text=normal_text)
+        # Drain EVERY complete tool call in the buffer, not just the first one
+        # (upstream #46565 case 3 / #50615). One chunk can carry several complete
+        # calls — DFlash speculative decoding and batched detokenization both
+        # hand the parser multi-token text. Returning after calls[0] parked the
+        # rest here until a chunk that often never came, so the client ran one
+        # call, never learned about the second, and re-asked.
+        while True:
+            start = current_text.find(self.bot_token)
+            if start == -1:
+                # No opening tag in what we hold. Hold back only a possible
+                # PARTIAL bot_token at the end (the tag may straddle chunks);
+                # everything else is safe to release as text.
+                hold = _partial_token_suffix(current_text, self.bot_token)
+                normal_text += current_text[: len(current_text) - len(hold)]
+                self._buffer = hold
+                break
 
-        # Parse the complete tool call block
-        result = self.detect_and_parse(current_text[: end + len(self.eot_token)], tools)
+            # Find end token AFTER the start token
+            end = current_text.find(self.eot_token, start)
+            if end == -1:
+                # Incomplete tool call: release text before it, keep buffering.
+                normal_text += current_text[:start]
+                self._buffer = current_text[start:]
+                break
 
-        if result.calls:
-            # Valid tool call - initialize tracking if first one
-            if self.current_tool_id == -1:
-                self.current_tool_id = 0
-                self.prev_tool_call_arr = []
-                self.streamed_args_for_tool = [""]
+            # Parse the complete tool call block
+            result = self.detect_and_parse(
+                current_text[: end + len(self.eot_token)], tools
+            )
+            normal_text += result.normal_text
 
-            while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                self.prev_tool_call_arr.append({})
-            while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                self.streamed_args_for_tool.append("")
+            if result.calls:
+                # Valid tool call - initialize tracking if first one
+                if self.current_tool_id == -1:
+                    self.current_tool_id = 0
+                    self.prev_tool_call_arr = []
+                    self.streamed_args_for_tool = [""]
 
-            call = result.calls[0]
-            self.prev_tool_call_arr[self.current_tool_id] = {
-                "name": call.name,
-                "arguments": json.loads(call.parameters) if call.parameters else {},
-            }
-            self.streamed_args_for_tool[self.current_tool_id] = call.parameters
-            call.tool_index = self.current_tool_id
-            self.current_tool_id += 1
+                for call in result.calls:
+                    while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                        self.prev_tool_call_arr.append({})
+                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                        self.streamed_args_for_tool.append("")
 
-        self._buffer = current_text[end + len(self.eot_token) :]
-        return result
+                    self.prev_tool_call_arr[self.current_tool_id] = {
+                        "name": call.name,
+                        "arguments": (
+                            json.loads(call.parameters) if call.parameters else {}
+                        ),
+                    }
+                    self.streamed_args_for_tool[self.current_tool_id] = call.parameters
+                    call.tool_index = self.current_tool_id
+                    self.current_tool_id += 1
+                    all_calls.append(call)
+
+            current_text = current_text[end + len(self.eot_token) :]
+            self._buffer = current_text
+
+        return StreamingParseResult(normal_text=normal_text, calls=all_calls)
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Release text still buffered when the stream ends (upstream #46566).
+
+        Without this, everything after the last tool call stayed in `_buffer`
+        forever: the client got a call with no accompanying answer, executed
+        it, and asked again — a loop the server manufactured, not the model.
+        """
+        tail = self._buffer
+        self._buffer = ""
+        return StreamingParseResult(normal_text=tail, calls=[])
 
     def _parse_tool_call(
         self, tool_call_body: str, tools: List[Tool]
