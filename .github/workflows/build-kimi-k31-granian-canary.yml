@@ -73,12 +73,14 @@ jobs:
             ':!python/sglang/srt/arg_groups/serving_hook.py' \
             ':!python/sglang/srt/entrypoints/http_server.py' \
             ':!python/sglang/srt/entrypoints/health_check.py' \
+            ':!python/sglang/srt/entrypoints/kubetee_evidence.py' \
             ':!.github/workflows/build-kimi-k31-granian-canary.yml' \
             ':!docker/k31-image/canary-test-requirements.txt' \
             ':!docker/k31-image/check_canary_context.py' \
             ':!docker/kubetee-granian-canary.Dockerfile' \
             ':!scripts/kimi-k31-granian-transport-test.py' \
-            ':!test/registered/unit/entrypoints/test_granian_mtls_health_only.py')
+            ':!test/registered/unit/entrypoints/test_granian_mtls_health_only.py' \
+            ':!test/registered/unit/entrypoints/test_kubetee_evidence.py')
           if [ -n "$CHANGED" ]; then
             printf '%s\n' "The transport canary cannot alter non-transport files:" "$CHANGED"
             exit 1
@@ -88,6 +90,14 @@ jobs:
             echo "image=ghcr.io/kubetee-ai/sglang:kimi-k31-granian-mtls-${GITHUB_RUN_ID}-${SOURCE_SHA:0:8}"
           } >> "$GITHUB_OUTPUT"
           echo "Transport-only immutable source: $SOURCE_SHA"
+      - name: KubeTEE evidence-relay conformance gate
+        # Pure-stdlib + openssl: JCS (RFC 8785 subset), the epoch statement
+        # hashed into REPORTDATA, the Layer-2 signature input, RFC 8032
+        # Ed25519, and the X.509 walk cross-checked against openssl. These are
+        # the byte-for-byte cross-language constructions a client verifies, so
+        # a regression here breaks every verifier (and the gateway circuit
+        # breaker). Runs before the image build; no model, GPU or network.
+        run: python3 test/registered/unit/entrypoints/test_kubetee_evidence.py
 
   build:
     name: Build, network-test and publish K3.1 transport canary
@@ -156,12 +166,14 @@ jobs:
             python/sglang/srt/arg_groups/fields/serving.py \
             python/sglang/srt/arg_groups/serving_hook.py \
             python/sglang/srt/entrypoints/http_server.py \
-            python/sglang/srt/entrypoints/health_check.py > context/merged.patch
+            python/sglang/srt/entrypoints/health_check.py \
+            python/sglang/srt/entrypoints/kubetee_evidence.py > context/merged.patch
           git diff --name-only --diff-filter=AMR "${BASE_COMMIT}" -- \
             python/sglang/srt/arg_groups/fields/serving.py \
             python/sglang/srt/arg_groups/serving_hook.py \
             python/sglang/srt/entrypoints/http_server.py \
-            python/sglang/srt/entrypoints/health_check.py > context/changed_py.txt
+            python/sglang/srt/entrypoints/health_check.py \
+            python/sglang/srt/entrypoints/kubetee_evidence.py > context/changed_py.txt
           git worktree add --detach /tmp/kimi-canary-base "${BASE_COMMIT}"
           git -C /tmp/kimi-canary-base apply --check < "${PWD}/context/merged.patch"
           git worktree remove --force /tmp/kimi-canary-base

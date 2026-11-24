@@ -538,6 +538,18 @@ from sglang.srt.runtime_context import (
 elastic_ep_router.route_class = ORJSONRoute
 app.include_router(elastic_ep_router)
 
+# KubeTEE backend evidence relay (role-scoped, strict-mTLS-only): relays this
+# guest's TDX quote + CC event log. The hardware registers (MRTD/RTMR0-3/
+# MRCONFIGID) leave the TD only through here — the measured agent policy
+# denies exec and the attestation-agent is loopback-only. The route rides the
+# main app, so it is reachable only on the mTLS listener (the health-only
+# Uvicorn serves /health and /health_generate exclusively).
+from sglang.srt.entrypoints.kubetee_evidence import (  # noqa: E402
+    router as kubetee_evidence_router,
+)
+
+app.include_router(kubetee_evidence_router)
+
 
 def _anthropic_validation_message(raw_errors) -> str:
     """Render Pydantic-style errors for an Anthropic /v1/messages route.
