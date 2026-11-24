@@ -57,6 +57,6 @@ Base pin: `lmsysorg/sglang:v0.5.23@sha256:f7876bef696ccf9cf75a2bf7ccb82970f5fa..
 ## Post-deploy canary
 
 Run `scripts/kimi-k31-granian-transport-test.py` (in-image at
-`/opt/kubetee/bin/`) against the live pod — it drives the Granite HTTP/2 mTLS
+`/opt/kubetee/bin/`) against the live pod — it drives the Granian HTTP/2 mTLS
 round trip and the health-only surface with the fixture cert/key/CA. Do not use
 it in production with the fixture certs.

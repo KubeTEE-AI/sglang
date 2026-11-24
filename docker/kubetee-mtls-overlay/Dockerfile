@@ -3,7 +3,7 @@
 # KubeTEE SGLang TRANSPORT mTLS overlay on an OFFICIAL SGLang release
 #
 # Strategy (user decision 2026-11-24): build the official release base with ONLY
-# the model-agnostic transport layer (Granite mTLS + health-only port), so one
+# the model-agnostic transport layer (Granian mTLS + health-only port), so one
 # image serves many models on the newest stable sglang. Model-layer patches
 # (DFlash penalties, MiMo tool-loop) are NOT baked in; each is applied a la carte
 # as a single extra layer in docker/kubetee-mtls-overlay/model-patches/ only when
@@ -35,15 +35,15 @@ USER root
 
 # --- provenance: verify the editable tree is the release we patched -------------
 RUN set -euo pipefail; \
-    python3 -c "import sglang, sys; print('sglang', sglang.__version__ if hasattr(sglang,'__version__') else '(no __version__)'); sys.path.insert(0, '/sgl-workspace/sglang/python'); from sglang.srt.entrypoints import http_server; print('http_server from', http_server.__file__)"; \
+    python3 -c "import sglang; print('sglang', getattr(sglang, '__version__', '(no __version__)'))"; \
     grep -q "0\.5\.23\|297e54fd" /sgl-workspace/sglang/python/sglang/version.py \
-      || echo "WARN: /sgl-workspace/sglang/python/sglang/version.py does not advertise 0.5.23"
+      || echo "WARN: version.py does not advertise 0.5.23"
 
 # --- preimage tripwires + transport patch (fuzz-free, byte-exact) ----------------
 # 0001: transport layer ONLY (serving.py flags, serving_hook validation +
 #       self_check_client_cert, health_check.UvicornHealthServer, http_server
 #       Granian mTLS + inbound verify derivation). Model patches stay out.
-COPY patches/0001-native-granian-mtls.patch /tmp/kubetee-transport/
+COPY overlay/docker/kubetee-mtls-overlay/patches/0001-native-granian-mtls.patch /tmp/kubetee-transport/
 RUN set -euo pipefail; \
     echo "0001 preimage: $(shasum -a 256 /sgl-workspace/sglang/python/sglang/srt/arg_groups/fields/serving.py  | cut -d' ' -f1)"; \
     echo "0001 preimage: $(shasum -a 256 /sgl-workspace/sglang/python/sglang/srt/arg_groups/serving_hook.py  | cut -d' ' -f1)"; \
@@ -69,33 +69,14 @@ c11df3a8d8f02445a735905bfb3b2f19b722c901b0e816c5f83addc7ee2a028b  /sgl-workspace
 EOF
     echo "TRANSPORT PATCH 0001 APPLIED CLEAN (byte-verified postimage)"
 
-# --- build gate: transport unit tests must PASS ---------------------------------
-# Runs the mTLS health-only + client-cert-verification test battery (the committed
-# suite's static tests, AST-imported here so they run without heavy sglang imports).
-# Self-contained stdlib-only (pytest not necessarily in the image); tests live as
-# data, never on PYTHONPATH. Full suite (incl. the granian client/server round-trip)
+# --- build gate: transport tests must PASS --------------------------------------
+# tests/ast_transport_check.py = stdlib-only AST check of the mTLS health-only +
+# client-cert verification wiring (no heavy sglang imports; pytest not required in
+# the image). The full pytest battery (incl. the Granian client/server round-trip)
 # runs in dev via:  PYTHONPATH=python pytest docker/kubetee-mtls-overlay/tests/
-COPY tests/ /tmp/kubetee-transport/tests/
+COPY overlay/docker/kubetee-mtls-overlay/tests/ /tmp/kubetee-transport/tests/
 RUN set -euo pipefail; \
-    cd /tmp/kubetee-transport; \
-    PYTHONDONTWRITEBYTECODE=1 /opt/sglang/bin/python3 - <<'PYEOF'
-import ast, pathlib
-base = pathlib.Path("/sgl-workspace/sglang/python/sglang/srt")
-hc = ast.parse((base / "entrypoints/health_check.py").read_text())
-assert any(isinstance(n, ast.ClassDef) and n.name == "UvicornHealthServer" for n in ast.walk(hc)), "UvicornHealthServer missing"
-hc_methods = {n.name for n in ast.walk(hc) if isinstance(n, ast.FunctionDef)}
-for m in ("run_server", "_entrypoint", "_dispatch", "_health_gen"):
-    assert m in hc_methods, f"health_check missing {m}"
-sh = ast.parse((base / "arg_groups/serving_hook.py").read_text())
-assert any(isinstance(n, ast.FunctionDef) and n.name == "self_check_client_cert" for n in ast.walk(sh)), "self_check_client_cert missing"
-hs = ast.parse((base / "entrypoints/http_server.py").read_text())
-hs_funcs = {n.name for n in ast.walk(hs) if isinstance(n, ast.FunctionDef)}
-assert {"_inbound_cert_reqs", "_inbound_client_verify"} <= hs_funcs, f"http_server verify helpers missing: {hs_funcs}"
-sv = ast.parse((base / "arg_groups/fields/serving.py").read_text())
-fields = {n.target.id for n in ast.walk(sv) if isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name)}
-assert {"ssl_client_verify", "health_only_port", "enable_ssl_refresh"} <= fields, f"serving.py fields missing: {fields}"
-print("TRANSPORT TESTS PASS (mTLS health-only + client-cert verification wired)")
-PYEOF
+    PYTHONDONTWRITEBYTECODE=1 /opt/sglang/bin/python3 /tmp/kubetee-transport/tests/ast_transport_check.py; \
     PYTHONDONTWRITEBYTECODE=1 /opt/sglang/bin/python3 -m py_compile \
       /sgl-workspace/sglang/python/sglang/srt/arg_groups/fields/serving.py \
       /sgl-workspace/sglang/python/sglang/srt/arg_groups/serving_hook.py \
@@ -104,7 +85,7 @@ PYEOF
     echo "PY_COMPILE OK"
 
 # --- live transport probe tooling (fixture cert-backed, post-deploy canary) -------
-COPY scripts/kimi-k31-granian-transport-test.py /opt/kubetee/bin/kimi-k31-granian-transport-test.py
+COPY overlay/scripts/kimi-k31-granian-transport-test.py /opt/kubetee/bin/kimi-k31-granian-transport-test.py
 
 ENV SGLANG_OVERLAY_BRANCH="kubetee-overlay" \
     SGLANG_TRANSPORT_LAYER="granian-mtls+health-only" \

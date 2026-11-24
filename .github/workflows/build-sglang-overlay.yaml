@@ -1,0 +1,234 @@
+# GitHub Actions workflow — build the KubeTEE SGLang overlay images.
+#
+# WHERE IT RUNS: `KubeTEE-AI/sglang` (the org's sglang fork). It is a workflow
+# file — `uses: ./.github/workflows/*` and workflow triggers only work within
+# their own repo, so this and the Dockerfiles live in that fork.
+#
+# VARIANTS (build surface per branch):
+#   mtls  (branch `kubetee-overlay`)             — OFFICIAL release base +
+#            transport/ layer ONLY (Granian mTLS + health-only :8000). The
+#            reusable multi-model base. Model-layer patches are NOT baked in.
+#   mimo  (branch `kubetee/mimo-penfix-r4-mtls-h2`) — nightly base source +
+#            unmerged upstream PR patches + MiMo tool-loop + Granian mTLS.
+#            The current MiMo-V2.6-pro RL production surface.
+#   dsv41 — replace source at sglang_sha with a MERGED upstream tree (its
+#            `docker/kubetee-overlay/Dockerfile` is NOT on this branch — port it
+#            before any dsv41 run).
+#
+# RUNNER: GitHub-hosted `ubuntu-24.04` (user directive 2026-11-24 — the former
+# self-hosted runner deregistered; `gh-only-image-builds.mdc` default).
+# ghcr.io push uses `secrets.GITHUB_TOKEN` (the fork's `packages: write`).
+#
+# RUN IT (transport mTLS on official v0.5.23):
+#   gh workflow run build-sglang-overlay.yaml \
+#       --repo KubeTEE-AI/sglang \
+#       --ref kubetee-overlay \
+#       -f variant=mtls \
+#       -f base_image=lmsysorg/sglang:v0.5.23@sha256:f7876bef696ccf9cf75a2bf7ccb82970f5fac577f082fb8ca95c9a59d2160eb5 \
+#       -f source_sha=297e54fd105e974cdf401e5b4d20253a22c16f90 \
+#       -f tag_prefix=v0.5.23-kubetee-mtls1
+#
+# RUN IT (mimo overlay "penfix1-r4-mtls" — 0004 MiMo tool-loop + 0005 Granian mTLS):
+#   gh workflow run build-sglang-overlay.yaml \
+#       --repo KubeTEE-AI/sglang \
+#       --ref kubetee/mimo-penfix-r4-mtls-h2 \
+#       -f variant=mimo \
+#       -f tag_prefix=mimo-cu13-20261105-penfix1-r4-mtls
+#
+# DESIGN NOTES:
+#   * amd64 only (single-arch, matches B200/H200 CC consumption).
+#   * Pushes to `ghcr.io/kubetee-ai/sglang` (NOT `lmsysorg/sglang` — that is
+#     upstream's Docker Hub org). The deploy manifest references ghcr.io.
+#   * Tags: EXACTLY `tag_prefix` (+ `<key>-latest`) when tag_prefix is set, else
+#     `<key>-<shortsha>-<date>`.
+#   * Base image + source SHA are `workflow_dispatch` inputs so a bump is just a
+#     re-run with new `-f` values; no code change.
+#   * BASE-PULL / ghcr-UPLOAD FRAGILITY (2026-10-17): the multi-GB lmsysorg base
+#     pull and the ghcr blob upload have both dropped mid-stream with pure
+#     transport errors (HTTP/2 CANCEL, AFD HTML 400, TCP RST, `tls: bad record
+#     MAC`, `use of closed network connection`), zero code involved. Transient:
+#     re-dispatch the identical run and it goes through. Do NOT misread a
+#     transport drop as a Dockerfile/patch error (the patch-set tripwires are the
+#     real failure signal — a patch/drift failure fails at the `sha256sum -c` /
+#     unit-test step with a clear message).
+#   * BUILD/PUSH SPLIT (2026-10-17): build `--load` (local docker) then `docker
+#     push` in a retry loop — a push HEAD-checks already-uploaded blobs and
+#     resumes only the missing ones, so retries are cheap and incremental. `push:
+#     true` couples build+push in one step, so a drop costs the whole run.
+#   * NO GHA BUILD CACHE (2026-10-17): cache load/export failed under upstream
+#     Actions cache-backend degradation. The build compiles nothing (pure
+#     source-layer overlay + unit tests), so a cold build is fast.
+#   * INPUT HANDLING: every `workflow_dispatch` input is passed to shell `run:`
+#     steps via `env:` (never interpolated into the command string) to avoid
+#     command injection.
+#   * SOURCE POLICY (mimo variant): upstream-AUTHORED but UNMERGED PR patches
+#     (#43518 stale grammar mask; #41738 penalizer cumulate) + a minimal reconcile
+#     patch to make them coexist on this base. We author no new fixes. On merge
+#     day: delete the merged patch(es), bump to the base containing the merge,
+#     rebuild. Full rationale in the mimo Dockerfile header.
+#   * SOURCE POLICY (mtls variant): ZERO model patches. Transport layer only.
+
+name: Build SGLang Overlay
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "mtls = official release + transport layer only (reusable base). mimo = nightly + unmerged patches (MiMo production). dsv41 = replace source at sglang_sha (needs its Dockerfile ported)."
+        required: false
+        default: "mtls"
+        type: choice
+        options: [mtls, mimo, dsv41]
+      base_image:
+        description: "Base sglang image (digest-pin for reproducibility)"
+        required: false
+        default: "lmsysorg/sglang:v0.5.23@sha256:f7876bef696ccf9cf75a2bf7ccb82970f5fac577f082fb8ca95c9a59d2160eb5"
+      sglang_sha:
+        description: "[dsv41] UNMODIFIED upstream sgl-project/sglang commit SHA to layer"
+        required: false
+        default: "656331295619a4d0267b40b7da0b5cd5b549fcbc"
+      source_sha:
+        description: "[mtls/mimo] upstream SHA the base image was built from (patch target + provenance)"
+        required: false
+        default: "297e54fd105e974cdf401e5b4d20253a22c16f90"
+      tag_prefix:
+        description: "Exact primary tag override (empty = computed <key>-<shortsha>-<date>)"
+        required: false
+        default: ""
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: kubetee-ai/sglang
+
+jobs:
+  build-and-push:
+    # GitHub-hosted (user directive 2026-11-24). ubuntu-24.04 = the GA LTS
+    # runner image; the CUDA-class base is ~42 GB unpacked, so the disk-lean step
+    # below is MANDATORY (a stock runner has only ~14 GB free).
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      # Free disk BEFORE touching docker: a stock GitHub-hosted runner has
+      # ~14 GB free and the CUDA-class base image is ~42 GB unpacked (15.7 GB
+      # compressed, 72 layers). Drop the biggest preinstalled toolchains (dotnet,
+      # android, ghc, ~20+ GB total). Do NOT `docker system prune -a` here — the
+      # workflow's own steps need docker; prune only dangling state.
+      - name: Free disk space (base image is ~42 GB unpacked)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Checkout build repo (for Dockerfiles + patch set)
+        uses: actions/checkout@v4
+        with:
+          path: overlay
+
+      # The overlay variants patch the base's own tree and do not need the full
+      # upstream checkout, but checking it out keeps provenance uniform (and the
+      # dsv41 variant needs it). Fetch via git (exact-SHA, reliable) rather than a
+      # remote `ADD` URL in the Dockerfile — the anonymous github.com archive
+      # fetch inside the build container failed 3/3 runs (stream CANCEL / AFD
+      # HTML 400 / TCP RST).
+      - name: Checkout upstream sglang at pinned SHA
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/sglang
+          ref: ${{ inputs.variant == 'dsv41' && inputs.sglang_sha || inputs.source_sha }}
+          path: sglang-src
+          fetch-depth: 1
+
+      - name: Trim build context (.git dirs)
+        run: |
+          printf '%s\n' 'overlay/.git' 'sglang-src/.git' '.git' > .dockerignore
+
+      # No buildx docker-container builder here ON PURPOSE: its separate build
+      # cache would hold a SECOND copy of the ~42 GB base and exhaust the disk.
+      # `docker build` through the default (docker-driver) builder keeps ONE
+      # image store; single-platform amd64 on an amd64 runner needs no buildx.
+      - name: Show docker + builder state
+        run: |
+          docker version
+          docker buildx ls 2>/dev/null || true
+          df -h /
+
+      - name: Login to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        env:
+          VARIANT: ${{ inputs.variant }}
+          DSV41_SHA: ${{ inputs.sglang_sha }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+        run: |
+          case "$VARIANT" in
+            mtls) SHA="$SOURCE_SHA"; KEY="mtls" ;;
+            mimo) SHA="$SOURCE_SHA"; KEY="mimo-cu13" ;;
+            *)    SHA="$DSV41_SHA";  KEY="dsv41" ;;
+          esac
+          SHORT="${SHA:0:8}"
+          DATE="$(date -u +%Y%m%d)"
+          PRIMARY="$TAG_PREFIX"
+          if [ -z "$PRIMARY" ]; then PRIMARY="${KEY}-${SHORT}-${DATE}"; fi
+          echo "primary=${REGISTRY}/${IMAGE_NAME}:${PRIMARY}" >> "$GITHUB_OUTPUT"
+          echo "alias=${REGISTRY}/${IMAGE_NAME}:${KEY}-latest" >> "$GITHUB_OUTPUT"
+
+      # Plain `docker build` through the default builder (single image store —
+      # see the buildx note above). Every input arrives via `env:` and is
+      # consumed as quoted "$VARS", never interpolated into the command string
+      # (the workflow-injection-safe pattern).
+      - name: Build (linux/amd64, local)
+        env:
+          VARIANT: ${{ inputs.variant }}
+          BASE_IMAGE_INPUT: ${{ inputs.base_image }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          DSV41_SHA: ${{ inputs.sglang_sha }}
+          PRIMARY_TAG: ${{ steps.tags.outputs.primary }}
+          ALIAS_TAG: ${{ steps.tags.outputs.alias }}
+        run: |
+          set -euo pipefail
+          case "$VARIANT" in
+            mtls) DOCKERFILE="overlay/docker/kubetee-mtls-overlay/Dockerfile"; SHA="$SOURCE_SHA" ;;
+            mimo) DOCKERFILE="overlay/docker/kubetee-mimo-overlay/Dockerfile"; SHA="$SOURCE_SHA" ;;
+            *)    DOCKERFILE="overlay/docker/kubetee-overlay/Dockerfile";       SHA="$DSV41_SHA" ;;
+          esac
+          docker build \
+            --platform linux/amd64 \
+            --build-arg "BASE_IMAGE=$BASE_IMAGE_INPUT" \
+            --build-arg "SGLANG_SHA=$SHA" \
+            --tag "$PRIMARY_TAG" \
+            --tag "$ALIAS_TAG" \
+            --file "$DOCKERFILE" \
+            .
+
+      - name: Push with retry (ghcr blob uploads drop mid-stream)
+        env:
+          PRIMARY_TAG: ${{ steps.tags.outputs.primary }}
+          ALIAS_TAG: ${{ steps.tags.outputs.alias }}
+        run: |
+          set -uo pipefail
+          for i in 1 2 3 4 5 6; do
+            if docker push "$PRIMARY_TAG"; then
+              docker push "$ALIAS_TAG" || true
+              exit 0
+            fi
+            echo "push attempt $i failed; sleeping $((i*30))s before retry" >&2
+            sleep $((i*30))
+          done
+          echo "push failed after 6 attempts" >&2
+          exit 1
+
+      - name: Print image digest
+        env:
+          PRIMARY_TAG: ${{ steps.tags.outputs.primary }}
+        run: |
+          echo "Built $PRIMARY_TAG"
+          docker buildx imagetools inspect "$PRIMARY_TAG" || true
