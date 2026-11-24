@@ -59,15 +59,23 @@
 #
 # COMPILED STACK UNTOUCHED; inherits the base's SGLANG_RUST_BUILD_MODE=never.
 
-ARG BASE_IMAGE=lmsysorg/sglang:v0.5.23@sha256:f7876bef696ccf9cf75a2bf7ccb82970f5fac577f082fb8ca95c9a59d2160eb5
-ARG SGLANG_SHA=297e54fd105e974cdf401e5b4d20253a22c16f90
-ARG KUBETEE_OVERLAY_TAG=v0.5.23-kubetee-mtls1
+# MULTI-BASE (one Dockerfile, key-selected transport patch — see README):
+#   * v0.5.23  BASE_IMAGE=lmsysorg/sglang:v0.5.23@sha256:f7876bef...  SGLANG_SHA=297e54fd...
+#   * nightly  BASE_IMAGE=lmsysorg/sglang:nightly-cu134-20261122-3117f58@sha256:ffb86520...  SGLANG_SHA=3117f580...
+#              (also covers nightly-dev-cu13-20261122-e96e9675@sha256:2207e32a... — same
+#               sglang tree at e96e96757018; the transport patch + tripwires key on the
+#               SOURCE COMMIT, so both tags are one base. Pass SGLANG_SHA=e96e96757018ce84...
+#               and add patches/by-sha-e96e9675/ = a copy of by-sha-3117f580/ if you need
+#               the -dev- tag; identical trees, identical hashes.)
+#   * a NEW base = a patches/by-sha-<8>/ dir (patch + preimage.sha + postimage.sha)
+#     + these two args. Fail-closed: an unknown SGLANG_SHA aborts the build.
+ARG BASE_IMAGE=lmsysorg/sglang:nightly-cu134-20261122-3117f58@sha256:ffb8652016b1b895cd2dee12f6bffcb7a5fa65af71378e1018c9f702faa05063
+ARG SGLANG_SHA=3117f5801752bfd8ea9aee8d3ba3dff8562378fd
 
 FROM ${BASE_IMAGE}
 
 ARG SGLANG_SHA
-ARG KUBETEE_OVERLAY_TAG
-LABEL org.opencontainers.image.title="sglang transport-mTLS overlay (official v0.5.23 + transport layer)" \
+LABEL org.opencontainers.image.title="sglang transport-mTLS overlay (sglang base + transport layer)" \
       org.opencontainers.image.revision="${SGLANG_SHA}" \
       ai.kubetee.overlay="mtls: native Granian mTLS + health-only :8000 on official v0.5.23; NO model-layer patches" \
       ai.kubetee.model-patches="none"
@@ -82,25 +90,30 @@ COPY overlay/docker/kubetee-mtls-overlay/patches /tmp/patches
 COPY overlay/docker/kubetee-mtls-overlay/tests /tmp/mtls-tests
 COPY overlay/scripts/kimi-k31-granian-transport-test.py /tmp/mtls-tests/kimi-k31-granian-transport-test.py
 
-# 2) Drift-tripwire the preimage, apply the transport patch in place (the base
-#    installs sglang editable at /sgl-workspace/sglang, so patching that tree IS
-#    the install), then tripwire the postimages. No `git`/`patch` trust: whichever
-#    applier runs, the postimage hashes are the authority.
+# 2) Multi-base support: the transport patch is ONE PER BASE (cleanly applicable
+#    with zero fuzz — upstream drift moves hunks; a single shared patch would only
+#    reach the other base via fuzz, which this build forbids). Each base's patch +
+#    pre/postimage drift-tripwire tables live in patches/<key>/. The key is
+#    selected from --build-arg SGLANG_SHA (= the upstream source commit the base
+#    image was built from). To add a base: drop patches/by-tag-<tag>/ (or
+#    by-sha-<8>), the patch + its two .sha tables (see README "adding a base").
+#    A missing key FAILS CLOSED — no silent fallback to another base's patch.
+#    No `git`/`patch` trust: whichever applier runs (zero fuzz either way), the
+#    postimage hashes are the authority.
 RUN set -eu; \
     ROOT=/sgl-workspace/sglang; \
     SV=$ROOT/python/sglang/srt/arg_groups/fields/serving.py; \
     SH=$ROOT/python/sglang/srt/arg_groups/serving_hook.py; \
     HS=$ROOT/python/sglang/srt/entrypoints/http_server.py; \
     HC=$ROOT/python/sglang/srt/entrypoints/health_check.py; \
-    mkdir -p /tmp/patches; \
-    ls -1 /tmp/patches; \
-    f=$(ls /tmp/patches/0001-*.patch); \
-    [ -f "$f" ] || { echo "FATAL: 0001 transport patch missing"; exit 1; }; \
-    echo "--- preimage drift tripwire (official v0.5.23 @ ${SGLANG_SHA})"; \
-    echo "d076f80d479b362062f43f897e017bfd69f0341bd0268018e3eae581dcc473a8  $SV" | sha256sum -c -; \
-    echo "0e8dd220bb17bb109797aa1bd4228b4dc89725fc8f1bb8ad10d3bc1ed6eb96ba  $SH" | sha256sum -c -; \
-    echo "d5d7ae6c5e8f403f9a46617377ab96977d9d4f1f263c0b90fc9fd2769eef061e  $HS" | sha256sum -c -; \
-    echo 'transport/ (mTLS + health-only) on official v0.5.23 (297e54fd)' > /etc/kubetee-sglang-overlay-release; \
+    SHORT=$(printf '%.8s' "$SGLANG_SHA"); \
+    KEY="/tmp/patches/by-sha-$SHORT"; \
+    [ -d "$KEY" ] || { echo "FATAL: no transport patch for this base (SGLANG_SHA=${SGLANG_SHA}); add patches/by-sha-$SHORT/ — fail closed"; exit 1; }; \
+    f=$(ls "$KEY"/0001-*.patch); \
+    [ -f "$f" ] || { echo "FATAL: 0001 transport patch missing in $KEY"; exit 1; }; \
+    echo "--- preimage drift tripwire (${KEY##*/} @ ${SGLANG_SHA})"; \
+    sha256sum -c "$KEY/preimage.sha"; \
+    echo "transport/ (mTLS + health-only) on ${KEY##*/} (${SGLANG_SHA})" > /etc/kubetee-sglang-overlay-release; \
     echo "--- applying transport patch: $f"; \
     if command -v git >/dev/null 2>&1; then \
       ( cd "$ROOT" && git apply --verbose "$f" ); \
@@ -108,10 +121,7 @@ RUN set -eu; \
       ( cd "$ROOT" && patch -p1 -F 0 < "$f" ); \
     fi; \
     echo "--- postimage drift tripwire (transport 0001)"; \
-    echo "df87b8ee3d6707b2596a95150bc5245023248fa5e4e679ae89c724836de145bd  $SV" | sha256sum -c -; \
-    echo "a1e631f286230492654e34f79b8c9b74cc05eb59e5e1ed914050e25509502847  $SH" | sha256sum -c -; \
-    echo "cc2b9cb7b3c8f28bc751e5288cd0fc3fb3d9595db3187620196b57964d9eefb6  $HS" | sha256sum -c -; \
-    echo "c11df3a8d8f02445a735905bfb3b2f19b722c901b0e816c5f83addc7ee2a028b  $HC" | sha256sum -c -; \
+    sha256sum -c "$KEY/postimage.sha"; \
     echo "--- smoke check: the patched files still compile"; \
     /opt/sglang/bin/python -m py_compile "$SV" "$SH" "$HS" "$HC"
 
@@ -186,5 +196,4 @@ PY
 COPY overlay/scripts/kimi-k31-granian-transport-test.py /opt/kubetee/bin/kimi-k31-granian-transport-test.py
 
 ENV SGLANG_OVERLAY_BRANCH="kubetee-overlay" \
-    SGLANG_TRANSPORT_LAYER="granian-mtls+health-only" \
-    SGLANG_BASE_RELEASE="v0.5.23"
+    SGLANG_TRANSPORT_LAYER="granian-mtls+health-only"
