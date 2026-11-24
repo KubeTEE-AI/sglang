@@ -42,11 +42,25 @@ for start, body in runs:
         fail = True
         print(p.stderr.strip())
 
-# --- 3. no functional heredoc in any RUN (comment lines mentioning it are fine) ---
+# --- 3. heredoc shape: only "RUN cmd - <<'TOKEN' ... TOKEN" is legal. A heredoc
+#        mid-chain (e.g. "shasum -c <<'EOF'" inside a \-continued RUN) makes the
+#        parser end the instruction at the body -> "unknown instruction". ---
+in_heredoc = False
 for n, ln in enumerate(lines, 1):
-    if re.search(r"<<-?\s*['\"]?\w+", ln) and not ln.lstrip().startswith("#"):
-        print(f"FAIL: functional heredoc at line {n}: {ln!r}")
-        fail = True
+    if in_heredoc:
+        if ln.strip() == heredoc_token:
+            in_heredoc = False
+        continue
+    if ln.lstrip().startswith("#"):
+        continue
+    m = re.search(r"<<-?\s*['\"]?(\w+)['\"]?\s*$", ln)
+    if m:
+        heredoc_token = m.group(1)
+        # legal only if the RUN instruction STARTS with the heredoc (r4's form)
+        if not ln.startswith("RUN "):
+            print(f"FAIL: heredoc not at the start of a RUN at line {n}: {ln!r}")
+            fail = True
+        in_heredoc = True
 
 # --- 4. bash-only-isms that dash rejects ---
 for n, ln in enumerate(lines, 1):
