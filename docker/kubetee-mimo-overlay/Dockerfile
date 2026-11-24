@@ -225,6 +225,8 @@ RUN set -eu; \
     export SGLANG_TEST_CERTS=/tmp/mtls-transport-certs; \
     rm -rf "$SGLANG_TEST_CERTS"; \
     cd /sgl-workspace/sglang; \
+    /opt/sglang/bin/pip install -q h2 requests 2>/dev/null || \
+      /opt/sglang/bin/python -m pip install -q h2 requests; \
     /opt/sglang/bin/python /tmp/mimo-tests/test_granian_mtls_health_only.py
 
 # 3) The full serving import surface still loads (paranoia — the patches are pure
