@@ -170,8 +170,11 @@ print("   serving flags present: ssl_client_verify + health_only_port + enable_s
 # cert; without one, behaviour is unchanged (plain TLS, CERT_NONE).
 assert _inbound_cert_reqs(SimpleNamespace(ssl_ca_certs="/etc/ssl/certs/ca-certificates.crt")) == ssl.CERT_REQUIRED
 assert _inbound_cert_reqs(SimpleNamespace(ssl_ca_certs=None)) == ssl.CERT_NONE
-assert _inbound_client_verify(SimpleNamespace(ssl_client_verify=True)) is True
-print("   inbound verify derivation OK: CA bundle -> CERT_REQUIRED, no CA -> CERT_NONE")
+# _inbound_client_verify derives mTLS from the CA BUNDLE (not a separate flag):
+# bool(ssl_ca_certs). This is the mirror of _inbound_cert_reqs above.
+assert _inbound_client_verify(SimpleNamespace(ssl_ca_certs="/etc/ssl/certs/ca-certificates.crt")) is True
+assert _inbound_client_verify(SimpleNamespace(ssl_ca_certs=None)) is False
+print("   inbound verify derivation OK: CA bundle -> CERT_REQUIRED + client-verify True, no CA -> CERT_NONE + False")
 
 # self_check_client_cert must exist and be the real function (the engine's own
 # startup self-probes depend on it or the engine SIGQUITs after weight load).
