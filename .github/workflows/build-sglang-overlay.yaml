@@ -3,22 +3,23 @@
 # WHERE IT RUNS: `KubeTEE-AI/sglang` (the org's sglang fork). It is a workflow
 # file — `uses: ./.github/workflows/*` and workflow triggers only work within
 # their own repo, so this and the Dockerfiles live in that fork. This branch
-# (`kubetee/mimo-penfix-r3`) carries the CURRENT build surface:
+# (`kubetee/mimo-penfix-r4-mtls-h2`) carries the CURRENT build surface:
 #   .github/workflows/build-sglang-overlay.yaml   (this file)
 #   docker/kubetee-mimo-overlay/Dockerfile        (mimo overlay — keeps the base
 #                                                  source byte-stable and applies
 #                                                  UNMERGED upstream PR patches)
 #   docker/kubetee-mimo-overlay/patches/*.patch   (the patch set, applied in-image)
-# The self-hosted runner `kubetee-side-aph5nt-MS-A2` is org-level and attached to
-# the fork (same runner the kata-deploy-shim-overlay / -ovmf builds use).
+# RUNNER: GitHub-hosted `ubuntu-24.04` (user directive 2026-11-24 — the former
+# self-hosted runner `kubetee-side-aph5nt-MS-A2` deregistered and its org runner
+# list is empty; also the `gh-only-image-builds.mdc` default is GitHub-hosted).
 # ghcr.io push uses `secrets.GITHUB_TOKEN` (the fork's `packages: write`).
 #
-# RUN IT (mimo overlay "penfix1" — base source + unmerged patches #43518 + #41738):
+# RUN IT (mimo overlay "penfix1-r4-mtls" — 0004 MiMo tool-loop + 0005 Granian mTLS):
 #   gh workflow run build-sglang-overlay.yaml \
 #       --repo KubeTEE-AI/sglang \
-#       --ref kubetee/mimo-penfix-r3 \
+#       --ref kubetee/mimo-penfix-r4-mtls-h2 \
 #       -f variant=mimo \
-#       -f tag_prefix=mimo-cu13-20261105-penfix1-r3
+#       -f tag_prefix=mimo-cu13-20261105-penfix1-r4-mtls
 #   (base_image + source_sha default to the nightly-dev-cu13-20261105-8df0cd51
 #    digest-pin + its build commit; override BOTH together on a base bump.)
 #
@@ -92,11 +93,25 @@ env:
 
 jobs:
   build-and-push:
-    runs-on: [self-hosted, Linux, X64]
+    # GitHub-hosted (user directive 2026-11-24). ubuntu-24.04 = the GA LTS
+    # runner image; the base is ~42 GB unpacked, so the disk-lean step below is
+    # MANDATORY (a stock runner has only ~14 GB free).
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
     steps:
+      # Free disk BEFORE touching docker: a stock GitHub-hosted runner has
+      # ~14 GB free and the CUDA-class base image is ~42 GB unpacked (15.7 GB
+      # compressed, 72 layers). Drop the biggest preinstalled toolchains (dotnet,
+      # android, ghc, ~20+ GB total). Do NOT `docker system prune -a` here — the
+      # workflow's own steps need docker; prune only dangling state.
+      - name: Free disk space (base image is ~42 GB unpacked)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h /
+
       - name: Checkout build repo (for Dockerfiles + patch set)
         uses: actions/checkout@v4
         with:
@@ -120,11 +135,20 @@ jobs:
         run: |
           printf '%s\n' 'overlay/.git' 'sglang-src/.git' '.git' > .dockerignore
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      # No buildx docker-container builder here ON PURPOSE: its separate build
+      # cache would hold a SECOND copy of the ~42 GB base and exhaust the disk.
+      # `docker build` through the default (docker-driver) builder keeps ONE
+      # image store; single-platform amd64 on an amd64 runner needs no buildx.
+      - name: Show docker + builder state
+        run: |
+          docker version
+          docker buildx ls 2>/dev/null || true
+          df -h /
 
       - name: Login to ghcr.io
-        uses: docker/login-action@v2
+        # v3 (actionlint flagged @v2: its runner runtime is too old for current
+        # GitHub runners). v3 is the same API surface (registry/username/password).
+        uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -150,20 +174,35 @@ jobs:
           echo "primary=${REGISTRY}/${IMAGE_NAME}:${PRIMARY}" >> "$GITHUB_OUTPUT"
           echo "alias=${REGISTRY}/${IMAGE_NAME}:${KEY}-latest" >> "$GITHUB_OUTPUT"
 
+      # Plain `docker build` through the default builder (single image store —
+      # see the buildx note above). Every input arrives via `env:` and is
+      # consumed as quoted "$VARS", never interpolated into the command string
+      # (the workflow-injection-safe pattern).
       - name: Build (linux/amd64, local)
-        uses: docker/build-push-action@v5
-        with:
-          context: .                             # workspace root: overlay/ + sglang-src/
-          file: ${{ inputs.variant == 'mimo' && 'overlay/docker/kubetee-mimo-overlay/Dockerfile' || 'overlay/docker/kubetee-overlay/Dockerfile' }}
-          push: false
-          load: true
-          platforms: linux/amd64
-          build-args: |
-            BASE_IMAGE=${{ inputs.base_image }}
-            SGLANG_SHA=${{ inputs.variant == 'mimo' && inputs.source_sha || inputs.sglang_sha }}
-          tags: |
-            ${{ steps.tags.outputs.primary }}
-            ${{ steps.tags.outputs.alias }}
+        env:
+          VARIANT: ${{ inputs.variant }}
+          BASE_IMAGE_INPUT: ${{ inputs.base_image }}
+          MIMO_SHA: ${{ inputs.source_sha }}
+          DSV41_SHA: ${{ inputs.sglang_sha }}
+          PRIMARY_TAG: ${{ steps.tags.outputs.primary }}
+          ALIAS_TAG: ${{ steps.tags.outputs.alias }}
+        run: |
+          set -euo pipefail
+          if [ "$VARIANT" = "mimo" ]; then
+            DOCKERFILE="overlay/docker/kubetee-mimo-overlay/Dockerfile"
+            SHA="$MIMO_SHA"
+          else
+            DOCKERFILE="overlay/docker/kubetee-overlay/Dockerfile"
+            SHA="$DSV41_SHA"
+          fi
+          docker build \
+            --platform linux/amd64 \
+            --build-arg "BASE_IMAGE=$BASE_IMAGE_INPUT" \
+            --build-arg "SGLANG_SHA=$SHA" \
+            --tag "$PRIMARY_TAG" \
+            --tag "$ALIAS_TAG" \
+            --file "$DOCKERFILE" \
+            .
 
       - name: Push with retry (ghcr blob uploads drop mid-stream)
         env:
