@@ -11,6 +11,7 @@ Fails on stock SGLang: it passes ssl_ca_certs but leaves verify_mode
 CERT_NONE, so the no-cert client connects in every case.
 """
 
+import os
 import socket
 import ssl
 import subprocess
@@ -149,6 +150,31 @@ def _connect(port, client=None, ca=None):
             pass
 
 
+def _http_server_src() -> Path:
+    """Locate ``http_server.py`` in EITHER test layout.
+
+    Worktree: ``<repo>/docker/kubetee-mimo-overlay/tests/this.py`` -> walk up to
+    ``<repo>/python/sglang/srt/entrypoints/http_server.py``. Image: the test is
+    copied to ``/tmp/mimo-tests/`` (only 2 ancestors — a hardcoded
+    ``parents[3]`` raises IndexError there, which is what failed the
+    2026-11-24 build) with the patched editable install at
+    ``/sgl-workspace/sglang``. ``SGLANG_HTTP_SERVER_SRC`` overrides both.
+    """
+    env = os.environ.get("SGLANG_HTTP_SERVER_SRC")
+    if env:
+        return Path(env)
+    rel = Path("python/sglang/srt/entrypoints/http_server.py")
+    here = Path(__file__).resolve()
+    for root in (here.parent, *here.parents):
+        candidate = root / rel
+        if candidate.is_file():
+            return candidate
+    candidate = Path("/sgl-workspace/sglang") / rel
+    if candidate.is_file():
+        return candidate
+    raise FileNotFoundError(f"cannot locate {rel} from {here}")
+
+
 def _derive_cert_reqs(ca):
     """Route through SGLang's own helper (patch 0005) rather than guessing.
 
@@ -159,7 +185,7 @@ def _derive_cert_reqs(ca):
     import ast
     from types import SimpleNamespace
 
-    src = Path(__file__).resolve().parents[3] / "python/sglang/srt/entrypoints/http_server.py"
+    src = _http_server_src()
     tree = ast.parse(src.read_text())
     nodes = [
         n
@@ -209,7 +235,7 @@ def test_sglang_derives_cert_reqs_from_ca_bundle():
     import ast
     from types import SimpleNamespace
 
-    src = (Path(__file__).resolve().parents[3] / "python/sglang/srt/entrypoints/http_server.py").read_text()
+    src = _http_server_src().read_text()
     tree = ast.parse(src)
     wanted = {"_inbound_client_verify", "_inbound_cert_reqs"}
     nodes = [

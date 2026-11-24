@@ -169,8 +169,19 @@ def _launcher_path():
     env = os.environ.get("SGLANG_TRANSPORT_LAUNCHER")
     if env:
         return env
-    repo = Path(__file__).resolve().parents[3]
-    return str(repo / "scripts" / "kimi-k31-granian-transport-test.py")
+    rel = "scripts/kimi-k31-granian-transport-test.py"
+    here = Path(__file__).resolve()
+    # Walk up (no hardcoded parents[N] — the image copies tests to a shallower
+    # path and parents[N] then raises IndexError; same lesson as
+    # test_inbound_mtls._http_server_src, 2026-11-24).
+    for root in (here.parent, *here.parents):
+        candidate = root / rel
+        if candidate.is_file():
+            return str(candidate)
+    candidate = Path("/tmp/mimo-tests") / Path(rel).name
+    if candidate.is_file():
+        return str(candidate)
+    raise FileNotFoundError(f"cannot locate {rel} from {here}")
 
 
 def serve(https, health):
