@@ -34,7 +34,7 @@ WORKDIR /sgl-workspace/sglang
 USER root
 
 # --- provenance: verify the editable tree is the release we patched -------------
-RUN set -euo pipefail; \
+RUN set -eu; \
     python3 -c "import sglang; print('sglang', getattr(sglang, '__version__', '(no __version__)'))"; \
     grep -q "0\.5\.23\|297e54fd" /sgl-workspace/sglang/python/sglang/version.py \
       || echo "WARN: version.py does not advertise 0.5.23"
@@ -48,7 +48,7 @@ COPY overlay/docker/kubetee-mtls-overlay/checksums/ /tmp/kubetee-transport/check
 # NOTE: no shell heredocs in these RUN steps on purpose — a `<<EOF` body inside a
 # \`-continued RUN breaks the Dockerfile parser (the body lines become "unknown
 # instruction"). The checksum manifests live in checksums/*.sha instead.
-RUN set -euo pipefail; \
+RUN set -eu; \
     echo "0001 preimage: $(sha256sum /sgl-workspace/sglang/python/sglang/srt/arg_groups/fields/serving.py  | cut -d' ' -f1)"; \
     echo "0001 preimage: $(sha256sum /sgl-workspace/sglang/python/sglang/srt/arg_groups/serving_hook.py  | cut -d' ' -f1)"; \
     echo "0001 preimage: $(sha256sum /sgl-workspace/sglang/python/sglang/srt/entrypoints/http_server.py | cut -d' ' -f1)"; \
@@ -69,7 +69,7 @@ RUN set -euo pipefail; \
 # the image). The full pytest battery (incl. the Granian client/server round-trip)
 # runs in dev via:  PYTHONPATH=python pytest docker/kubetee-mtls-overlay/tests/
 COPY overlay/docker/kubetee-mtls-overlay/tests/ /tmp/kubetee-transport/tests/
-RUN set -euo pipefail; \
+RUN set -eu; \
     PYTHONDONTWRITEBYTECODE=1 /opt/sglang/bin/python3 /tmp/kubetee-transport/tests/ast_transport_check.py; \
     PYTHONDONTWRITEBYTECODE=1 /opt/sglang/bin/python3 -m py_compile \
       /sgl-workspace/sglang/python/sglang/srt/arg_groups/fields/serving.py \
