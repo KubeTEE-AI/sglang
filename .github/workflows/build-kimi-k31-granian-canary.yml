@@ -103,6 +103,8 @@ jobs:
     name: Build, network-test and publish K3.1 transport canary
     needs: provenance
     runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.resolve.outputs.digest }}
     permissions:
       contents: read
       packages: write # Push the immutable GHCR candidate.
@@ -271,3 +273,26 @@ jobs:
           path: provenance.txt
           if-no-files-found: error
           retention-days: 30
+
+  # === KubeTEE attestation automation (measure -> sign -> publish) ===
+  # Chains the shared publisher in KubeTEE-AI/kubetee-website so every new SGLang
+  # kimi-k3.1-pro image is measured, signed and published automatically once deployed.
+  # Registers (MRTD/RTMR0-3/MRCONFIGID) are launch-config-derived (shared across nodes
+  # + the v0.5.23/nightly lineages); a new image adds provenance + a live verification,
+  # not new registers. Skipped (not failed) until the attestation secrets/vars are set.
+  measure-sign-publish:
+    if: ${{ github.repository == 'KubeTEE-AI/sglang' && github.event_name != 'pull_request' && vars.TDX_GUEST_HOST != '' }}
+    needs: [provenance, build]
+    uses: KubeTEE-AI/kubetee-website/.github/workflows/measure-sign-publish.yml@main
+    with:
+      image_ref: ${{ needs.provenance.outputs.image }}@${{ needs.build.outputs.digest }}
+      tee: tdx
+      model: sglang-kimi-k3-1-pro
+      guest_host: ${{ vars.TDX_GUEST_HOST }}
+      evidence_path: /kubetee/evidence
+      json_name: tee-measurements-sglang.tdx.json
+    secrets:
+      TEE_MEASUREMENTS_SIGNING_KEY: ${{ secrets.TEE_MEASUREMENTS_SIGNING_KEY }}
+      WEBSITE_REPO_TOKEN: ${{ secrets.WEBSITE_REPO_TOKEN }}
+      EASTWEST_CLIENT_CERT: ${{ secrets.EASTWEST_CLIENT_CERT }}
+      EASTWEST_CLIENT_KEY: ${{ secrets.EASTWEST_CLIENT_KEY }}
