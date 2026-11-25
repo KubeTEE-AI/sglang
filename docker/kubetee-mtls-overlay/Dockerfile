@@ -75,10 +75,11 @@ ARG SGLANG_SHA=3117f5801752bfd8ea9aee8d3ba3dff8562378fd
 FROM ${BASE_IMAGE}
 
 ARG SGLANG_SHA
-LABEL org.opencontainers.image.title="sglang transport-mTLS overlay (sglang base + transport layer)" \
+LABEL org.opencontainers.image.title="sglang transport-mTLS overlay (sglang base + transport + evidence layer)" \
       org.opencontainers.image.revision="${SGLANG_SHA}" \
-      ai.kubetee.overlay="mtls: native Granian mTLS + health-only :8000 on official v0.5.23; NO model-layer patches" \
-      ai.kubetee.model-patches="none"
+      ai.kubetee.overlay="mtls: native Granian mTLS + health-only :8000 + GET /kubetee/evidence relay; NO model-layer patches" \
+      ai.kubetee.model-patches="none" \
+      ai.kubetee.evidence-route="GET /kubetee/evidence (role-scoped, mTLS-only)"
 
 WORKDIR /sgl-workspace
 
@@ -150,6 +151,42 @@ RUN set -eu; \
       /opt/sglang/bin/python -m pip install -q h2 requests; \
     /opt/sglang/bin/python /tmp/mtls-tests/test_granian_mtls_health_only.py
 
+# 2d) Evidence relay — the `GET /kubetee/evidence` route (kubetee_evidence.py +
+#     its http_server mount). This is the ONLY path by which the guest's TDX
+#     hardware registers (MRTD/RTMR0-3/MRCONFIGID) leave the TD: the measured
+#     agent policy denies exec and the AA is loopback-only. The route rides the
+#     MAIN app so it is reachable only on the strict-mTLS listener (never the
+#     health-only :8000). Transport-layer role (model-agnostic), like the rest of
+#     this overlay — no model-layer coupling. It is a base-keyed patch because
+#     its http_server hunk context follows the base's own http_server shape.
+#     Tripwires + a build-time conformance run (pure stdlib crypto: JCS, RFC 8785
+#     REPORTDATA, Layer-2 signature input, RFC 8032 Ed25519, X.509 walk).
+RUN set -eu; \
+    ROOT=/sgl-workspace/sglang; \
+    HS=$ROOT/python/sglang/srt/entrypoints/http_server.py; \
+    KE=$ROOT/python/sglang/srt/entrypoints/kubetee_evidence.py; \
+    KT=$ROOT/test/registered/unit/entrypoints/test_kubetee_evidence.py; \
+    SHORT=$(printf '%.8s' "$SGLANG_SHA"); \
+    KEY="/tmp/patches/by-sha-$SHORT"; \
+    f=$(ls "$KEY"/0005-*.patch); \
+    [ -f "$f" ] || { echo "FATAL: 0005 evidence-route patch missing in $KEY"; exit 1; }; \
+    echo "--- evidence preimage drift tripwire (post-transport http_server)"; \
+    echo "03168d39c4a9ef58bca48a561b138f2a953ffb3388fb4e756db337b9a9d582e1  $HS" | sha256sum -c -; \
+    echo "--- applying evidence-route patch: $f"; \
+    if command -v git >/dev/null 2>&1; then \
+      ( cd "$ROOT" && git apply --verbose "$f" ); \
+    else \
+      ( cd "$ROOT" && patch -p1 -F 0 < "$f" ); \
+    fi; \
+    echo "--- evidence postimage drift tripwire (+ route + mount)"; \
+    echo "7968f7fa851c2776b13392f8076d8740548ef0886faa6a4ceb708ea7595c3cc2  $HS" | sha256sum -c -; \
+    echo "3784835bf7c027babb8ed76ce7d41328083b66e0395f1ee4970f51ad54143106  $KE" | sha256sum -c -; \
+    echo "f5712522919b98c9e41ab748b13ab74fc66188f0061f0f858a9c9c030d45d42e  $KT" | sha256sum -c -; \
+    echo "--- evidence conformance: the mounted route compiles + the KATs pass"; \
+    /opt/sglang/bin/python -m py_compile "$HS" "$KE"; \
+    cd "$ROOT/test/registered/unit/entrypoints"; \
+    /opt/sglang/bin/python test_kubetee_evidence.py
+
 # 3) Runtime import + behaviour check (paranoia that pays: the transport layer
 #    must not merely compile but load and DERIVE its verify mode correctly).
 RUN /opt/sglang/bin/python - <<'PY'
@@ -164,6 +201,10 @@ from sglang.srt.entrypoints.http_server import (
     _inbound_cert_reqs,
     _inbound_client_verify,
 )
+from sglang.srt.entrypoints.kubetee_evidence import router as _ke_router
+
+assert _ke_router is not None, "evidence router failed to register (fastapi import)"
+print("   kubetee/evidence router: ", type(_ke_router).__name__)
 
 print("transport overlay import OK:", getattr(sglang, "__version__", "n/a"))
 print("   UvicornHealthServer:     ", UvicornHealthServer.__module__)
@@ -196,4 +237,4 @@ PY
 COPY overlay/scripts/kimi-k31-granian-transport-test.py /opt/kubetee/bin/kimi-k31-granian-transport-test.py
 
 ENV SGLANG_OVERLAY_BRANCH="kubetee-overlay" \
-    SGLANG_TRANSPORT_LAYER="granian-mtls+health-only"
+    SGLANG_TRANSPORT_LAYER="granian-mtls+health-only+kubetee-evidence"
