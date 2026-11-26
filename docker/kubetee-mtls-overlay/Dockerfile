@@ -180,8 +180,8 @@ RUN set -eu; \
     fi; \
     echo "--- evidence postimage drift tripwire (+ route + mount)"; \
     echo "7968f7fa851c2776b13392f8076d8740548ef0886faa6a4ceb708ea7595c3cc2  $HS" | sha256sum -c -; \
-    echo "3784835bf7c027babb8ed76ce7d41328083b66e0395f1ee4970f51ad54143106  $KE" | sha256sum -c -; \
-    echo "f5712522919b98c9e41ab748b13ab74fc66188f0061f0f858a9c9c030d45d42e  $KT" | sha256sum -c -; \
+    echo "8127865f0331e4917b806c89047d369a01225173ace71f46af952e37454ec62d  $KE" | sha256sum -c -; \
+    echo "cae698e6202235a25410249a1c7dfaf2b63139901bccd4c169be2cbe138bdddb  $KT" | sha256sum -c -; \
     echo "--- evidence conformance: the mounted route compiles + the KATs pass"; \
     /opt/sglang/bin/python -m py_compile "$HS" "$KE"; \
     cd "$ROOT/test/registered/unit/entrypoints"; \
@@ -231,6 +231,18 @@ print("   inbound verify derivation OK: CA bundle -> CERT_REQUIRED + client-veri
 # startup self-probes depend on it or the engine SIGQUITs after weight load).
 assert callable(self_check_client_cert) and callable(handle_ssl_validation)
 print("   self_check_client_cert + handle_ssl_validation callable")
+
+# GPU-evidence transport: the fresh CPU+8GPU path calls NVML's Confidential
+# Computing report + cert-chain APIs. Assert they exist in the bundled
+# nvidia-ml-py NOW (no GPU needed — attribute check only) so a base whose
+# nvidia-ml-py predates them FAILS THE BUILD, not the canary on B200 hardware.
+import pynvml as _nv
+for _sym in (
+    "nvmlDeviceGetConfComputeGpuAttestationReport",
+    "nvmlDeviceGetConfComputeGpuCertificate",
+):
+    assert callable(getattr(_nv, _sym, None)), f"nvidia-ml-py lacks {_sym} (Conf-Compute GPU evidence transport)"
+print("   pynvml Conf-Compute APIs present (GPU attestation report + cert chain)")
 PY
 
 # 4) The post-deploy canary tooling, available in-image.
