@@ -180,7 +180,7 @@ RUN set -eu; \
     fi; \
     echo "--- evidence postimage drift tripwire (+ route + mount)"; \
     echo "7968f7fa851c2776b13392f8076d8740548ef0886faa6a4ceb708ea7595c3cc2  $HS" | sha256sum -c -; \
-    echo "3fabb138cf29f8f54062ec2c6a47dfa9fe75d92ecb040e3567b019d221fd31ce  $KE" | sha256sum -c -; \
+    echo "8fa9b2d85c5ca741f64ac59d20e4bac3de6fe9d7fa3806783ebad3fe5ffc29c7  $KE" | sha256sum -c -; \
     echo "d987740e450823e4d6cef05b0e1dc98a8928b683aabc5a6b86f14f549dc6ac73  $KT" | sha256sum -c -; \
     echo "--- evidence conformance: the mounted route compiles + the KATs pass"; \
     /opt/sglang/bin/python -m py_compile "$HS" "$KE"; \
